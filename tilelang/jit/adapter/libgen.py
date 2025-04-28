@@ -99,6 +99,7 @@ class LibraryGenerator(object):
         src.write(self.lib_code)
         src.flush()
         try:
+            logger.info(f"Compile command: {' '.join(command)}")
             ret = subprocess.run(command, timeout=timeout)
         except Exception as e:
             raise RuntimeError(f"Compile kernel failed because of {e}") from e
