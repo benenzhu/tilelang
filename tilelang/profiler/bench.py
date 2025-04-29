@@ -4,6 +4,7 @@
 
 import torch
 from typing import Callable, List, Literal, Optional, Union
+import time
 
 
 def do_bench(
@@ -75,7 +76,10 @@ def do_bench(
     for _ in range(n_warmup):
         fn()
     # Benchmark
+    tic = time.time()
+    print(f"bench start {n_warmup=} {n_repeat=}", flush=True)
     for i in range(n_repeat):
+        # print(f"{i} of {n_repeat}", flush=True)
         # we don't want `fn` to accumulate gradient values
         # if it contains a backward pass. So we clear the
         # provided gradients
@@ -90,10 +94,12 @@ def do_bench(
         end_event[i].record()
     # Record clocks
     torch.cuda.synchronize()
+    toc = time.time()
     times = torch.tensor(
         [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
         dtype=torch.float,
     )
+    print(f"bench end, time: {toc - tic}", flush=True)
     if quantiles is not None:
         ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float)).tolist()
         if len(ret) == 1:

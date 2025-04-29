@@ -185,6 +185,7 @@ class Profiler:
             float: Average execution time in milliseconds
         """
         profiler = self.determine_profiler(func)
+        print(f"Profiler: {profiler}")
         if profiler == "torch":
             if func is None:
                 assert self.adapter is not None, "benchmarking function should be provided"

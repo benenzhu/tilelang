@@ -147,7 +147,7 @@ def calc_diff(x, y):
 
 
 def assert_tl_gemm_correctness(M, N, K, in_dtype, out_dtype, accum_dtype):
-    gemm = tl_gemm(M, N, K, in_dtype, out_dtype, accum_dtype)
+    gemm = tl_gemm(M, N, K, in_dtype, out_dtype, accum_dtype, accum_dtype)
     kernel = TL.compile(gemm, out_idx=[])
     src_code = kernel.get_kernel_source()
 
@@ -185,4 +185,4 @@ if __name__ == "__main__":
     for dtype in ["e4m3_float8"]:
         for out_dtype in ["bfloat16", "float32"]:
             for block_N in [16, 32, 64, 128]:
-                assert_tl_gemm_correctness(1024, 1024, 8192, block_N, dtype, out_dtype, "float32")
+                assert_tl_gemm_correctness(1024, 1024, 8192, block_N, dtype, out_dtype)
