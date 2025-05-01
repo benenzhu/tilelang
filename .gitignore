@@ -92,3 +92,5 @@ tilelang/jit/adapter/cython/.cycache
 
 # cache directory for clangd
 .cache/
+*.json
+tmp*.cu

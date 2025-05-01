@@ -51,6 +51,7 @@ def tl_gemm(
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
 
+            # print(in_dtype, out_dtype, accum_dtype, flush=True)
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype)
@@ -74,6 +75,8 @@ def tl_gemm(
                 for i in T.Parallel(block_M):
                     Scale_C_shared[i] = scales_a[by * block_M + i, k] * Scale_B
 
+                # print(A_shared.shape, B_shared.shape, C_local.shape, flush=True)
+                # print(A_shared.scope(), A_shared.script(), A_shared.WRITE)
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True)
                 # Promote to enable 2xAcc
                 for i, j in T.Parallel(block_M, block_N):

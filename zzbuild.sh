@@ -1,4 +1,4 @@
-mkidr build 
+mkdir build 
 cp 3rdparty/tvm/cmake/config.cmake build
 cd build
 # echo "set(USE_LLVM ON)" >> config.cmake
