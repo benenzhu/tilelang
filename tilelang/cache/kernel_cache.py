@@ -326,6 +326,7 @@ class KernelCache:
             Use with caution as this operation cannot be undone.
         """
         try:
+            self.logger.log(f"clear cache: {self.cache_dir}")
             if os.path.exists(self.cache_dir):
                 shutil.rmtree(self.cache_dir)  # Delete entire cache directory
             os.makedirs(self.cache_dir, exist_ok=True)  # Re-create cache directory

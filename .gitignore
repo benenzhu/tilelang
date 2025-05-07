@@ -94,3 +94,5 @@ tilelang/jit/adapter/cython/.cycache
 .cache/
 *.json
 tmp*.cu
+*.info
+result

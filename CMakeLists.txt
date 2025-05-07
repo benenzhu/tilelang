@@ -52,6 +52,8 @@ endif()
 # Enforce CUDA standard
 if(USE_CUDA)
   set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -lgcov")
 endif()
 
 # Enforce HIP standard
