@@ -105,3 +105,25 @@ from .engine import lower, register_cuda_postproc, register_hip_postproc  # noqa
 from .version import __version__  # noqa: F401
 
 from .math import *  # noqa: F403
+
+
+with open("pass.py", "w") as f:
+    pass
+
+def logpass(*msg) -> None:
+    import sys
+    import os
+    try:
+        raise Exception
+    except:
+        linenum = sys.exc_info()[2].tb_frame.f_back.f_lineno
+        filename = sys.exc_info()[2].tb_frame.f_back.f_code.co_filename
+
+    with open("pass.py", "a", encoding="UTF-8") as f:
+        f.write(f"--------------------------------------------------------")
+        f.write(f'{os.getcwd()}/{filename.split("/")[-1]}:{linenum}:\n')
+        f.write(' '.join([str(i) for i in msg]))
+        f.write("\n")
+    # print(f"\n\n\n\n\n--------------------------------------------------------\n", flush=True)
+    # print(f'{os.getcwd()}/{filename.split("/")[-1]}:{linenum}:\n', *msg, flush=True)
+    # print(' ', end = "", flush=True)

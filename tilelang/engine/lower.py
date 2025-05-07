@@ -138,14 +138,24 @@ def canon_target_host(target: Union[str, Target], target_host: Optional[Union[st
 
 
 def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
+    from tilelang import logpass
     host_mod = tir.transform.BindTarget(target_host)(host_mod)
+    logpass("after tir.transform.BindTarget", host_mod)
     host_mod = tir.transform.FP8StorageLegalize()(host_mod)
+    logpass("after tir.transform.FP8StorageLegalize", host_mod)
     host_mod = tir.transform.BF16StorageLegalize()(host_mod)
+    logpass("after tir.transform.BF16StorageLegalize", host_mod)
     host_mod = tir.transform.LowerTVMBuiltin()(host_mod)
+    logpass("after tir.transform.LowerTVMBuiltin", host_mod)
     host_mod = tir.transform.LowerCustomDatatypes()(host_mod)
+    logpass("after tir.transform.LowerCustomDatatypes", host_mod)
     host_mod = tir.transform.LowerIntrin()(host_mod)
+    logpass("after tir.transform.LowerIntrin", host_mod)
     host_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(host_mod)
+    logpass("after tilelang.transform.LowerDeviceStorageAccessInfo", host_mod)
     host_mod = tir.transform.CombineContextCall()(host_mod)
+    logpass("after tir.transform.CombineContextCall", host_mod)
+    logpass(f"{target_host.kind.name=}")
     if target_host.kind.name == "llvm":
         host_mod = tvm._ffi.get_global_func("target.build.llvm")(host_mod, target_host)
     elif target_host.kind.name == "c":
@@ -156,12 +166,17 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    from tilelang import logpass
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
+    print("after tilelang.transform.LowerDeviceStorageAccessInfo", device_mod, flush=True)
+    logpass("after tilelang.transform.LowerDeviceStorageAccessInfo", device_mod)
     device_mod = tir.transform.LowerIntrin()(device_mod)
+    logpass("after tir.transform.LowerIntrin", device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
-
+    logpass("after tir.transform.Simplify", device_mod)
     if target.kind.name == "cuda":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_cuda")(device_mod, target)
+        logpass("after tvm._ffi.get_global_func(\"target.build.tilelang_cuda\")", device_mod)
     elif target.kind.name == "hip":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
     else:
@@ -171,12 +186,20 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    from tilelang import logpass
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
+    logpass("after tilelang.transform.LowerDeviceStorageAccessInfo", device_mod)
     device_mod = tir.transform.LowerIntrin()(device_mod)
+    logpass("after tir.transform.LowerIntrin", device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
+    logpass("after tir.transform.Simplify final::: ", device_mod)
+    logpass(type(device_mod))
     if target.kind.name == "cuda":
-        device_mod = tvm._ffi.get_global_func("target.build.tilelang_cuda_without_compile")(
+        device_mod:tvm.runtime.module.Module = tvm._ffi.get_global_func("target.build.tilelang_cuda_without_compile")(
             device_mod, target)
+        logpass(type(device_mod))
+        logpass("get source", device_mod.get_source())
+        logpass("after tvm._ffi.get_global_func(\"target.build.tilelang_cuda_without_compile\")", device_mod)
     elif target.kind.name == "hip":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_hip_without_compile")(
             device_mod, target)
@@ -206,6 +229,7 @@ def lower(
         enable_device_compile: whether to enable device codegen, default is False, as we have our
         own device codegen implementation in jit.
     '''
+    from tilelang import logpass
 
     mod = func_or_mod
     params = None
@@ -232,8 +256,11 @@ def lower(
     mod = OptimizeForTarget(mod, target)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
+    logpass("after tir.transform.Filter(_is_host_call)", host_mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)
+    logpass("after tir.transform.Filter(_is_device_call)", device_mod)
 
+    logpass("before device_codegen")
     codegen_mod = device_codegen(
         device_mod, target) if enable_device_compile else device_codegen_without_compile(
             device_mod, target)

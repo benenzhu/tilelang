@@ -96,3 +96,12 @@ tilelang/jit/adapter/cython/.cycache
 tmp*.cu
 *.info
 result
+before
+after
+a.cu
+*.ncu-rep
+*.ptx
+core.*
+final.cu
+pass.py
+nohup.*

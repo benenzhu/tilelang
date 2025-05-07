@@ -5,6 +5,7 @@
  * \file target/codegen.cc
  */
 
+#define L(x)  " " << #x << ": "<< x <<", "
 #include "codegen_cuda.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/runtime/registry.h>
@@ -63,6 +64,7 @@ void CodeGenTileLangCUDA::PrintFuncPrefix(std::ostream &os) {
 class LaunchConfigExtractor : public tir::StmtVisitor {
 private:
   void VisitStmt_(const AttrStmtNode *op) final {
+    LOG(INFO) << "zty:: LaunchConfigExtractor::AttrStmtNode: " << L(tvm::DumpStr(op));
     if (op->attr_key == tir::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
       if (iv->var->name_hint == "threadIdx.x" ||
@@ -769,6 +771,7 @@ std::string CodeGenTileLangCUDA::GetBufferRef(DataType t,
 }
 
 void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
+  LOG(INFO) << "zty:: CodeGenTileLangCUDA::CallNode: " << L(tvm::DumpStr(op));
   auto print_extern_call_stmt = [&](std::string name, size_t offset = 0) {
     this->PrintIndent();
     this->stream << name << "(";
@@ -1241,6 +1244,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
 }
 
 void CodeGenTileLangCUDA::VisitStmt_(const AttrStmtNode *op) {
+  LOG(INFO) << "zty:: void CodeGenTileLangCUDA::AttrStmtNode: " << L(tvm::DumpStr(op));
   if (op->attr_key == tir::attr::fragment_shape) {
     const VarNode *buffer = op->node.as<VarNode>();
     const StringImmNode *shape_str = op->value.as<StringImmNode>();
@@ -1282,6 +1286,7 @@ void CodeGenTileLangCUDA::VisitStmt_(const AttrStmtNode *op) {
 }
 
 void CodeGenTileLangCUDA::VisitStmt_(const AllocateNode *op) {
+  LOG(INFO) << "zty:: void CodeGenTileLangCUDA::AllocateNode: " << L(tvm::DumpStr(op));
   ICHECK(!is_zero(op->condition));
   std::string vid = AllocVarID(op->buffer_var.get());
   this->PrintIndent();
@@ -1355,6 +1360,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const RampNode *op, std::ostream &os) {
 
 void CodeGenTileLangCUDA::VisitExpr_(const BroadcastNode *op,
                                      std::ostream &os) { // NOLINT(*)
+
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8 &&
       lanes == 4) {
@@ -1742,11 +1748,13 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
   CodeGenC::PrintType(f->ret_type, stream);
   this->PrintExtraAttrs(f);
 
+  LOG(INFO) << "zty:: " << L(global_symbol.value());
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
     tir::Var v = f->params[i];
     std::string vid = AllocVarID(v.get());
+    LOG(INFO) << "zty:: param::" << L(v);
     if (i != 0)
       stream << ", ";
     if (v.dtype().is_handle()) {
@@ -1783,6 +1791,7 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+  LOG(INFO) << "zty:: body::" << L(f->body);
   this->PrintStmt(f->body);
   this->EndScope(func_scope);
   this->PrintIndent();

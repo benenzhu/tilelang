@@ -3,9 +3,11 @@ cp 3rdparty/tvm/cmake/config.cmake build
 cd build
 # echo "set(USE_LLVM ON)" >> config.cmake
 echo "set(USE_CUDA ON)" >> config.cmake 
+echo "set(USE_RELAY_DEBUG ON)" >> config.cmake
+echo "set(CMAKE_BUILD_TYPE Debug)" >> config.cmake
 # or echo "set(USE_ROCM ON)" >> config.cmake to enable ROCm runtime
-cmake ..
-mold -run make -j
+cmake -DCMAKE_BUILD_TYPE=Debug ..
+mold -run make -j46
 
 exit 0
 

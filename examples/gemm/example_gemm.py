@@ -32,7 +32,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 
 func = matmul(1024, 1024, 1024, 128, 128, 32, dtype="float16")
 
-print(func)
+# print(func)
 
 kernel = tilelang.compile(func, out_idx=-1)
 
@@ -57,11 +57,11 @@ print("All check passed.")
 
 profiler = kernel.get_profiler()
 
-best_latency = profiler.do_bench(n_repeat=1)
+# best_latency = profiler.do_bench(n_repeat=1)
 
 total_flops = 2 * 1024 * 1024 * 1024
-print(f"Best latency (ms): {best_latency}")
-print(f"Best TFlops: {total_flops / best_latency * 1e-9:.3f}")
+# print(f"Best latency (ms): {best_latency}")
+# print(f"Best TFlops: {total_flops / best_latency * 1e-9:.3f}")
 
 # Get CUDA Source
 print("CUDA Source:")
