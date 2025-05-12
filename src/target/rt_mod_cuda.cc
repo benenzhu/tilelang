@@ -77,14 +77,11 @@ runtime::Module BuildTileLangCUDAWithoutCompile(IRModule mod, Target target) {
   CodeGenTileLangCUDA cg;
   cg.Init(output_ssa);
 
-  LOG(INFO) << "zty:: " << L(mod->functions.size());
   for (auto kv : mod->functions) {
     ICHECK(kv.second->IsInstance<PrimFuncNode>())
         << "CodeGenTileLangCUDA: Can only take PrimFunc";
     auto gvar = Downcast<GlobalVar>(kv.first);
-    LOG(INFO) << "zty:: " << L(gvar);
     auto f = Downcast<PrimFunc>(kv.second);
-    LOG(INFO) << "zty:: " << L(f);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
     ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
     cg.AddFunction(gvar, f);

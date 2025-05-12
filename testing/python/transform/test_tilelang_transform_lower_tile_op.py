@@ -1,5 +1,6 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
+import torch
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 import tilelang as tl
@@ -67,13 +68,16 @@ def test_loop_tail_split(block_M, block_N, block_K, threads, vec_load_b, dtype):
                                                (block_N // vec_load_b) + vec], T.float16(0))
 
     mod = tvm.tir.transform.BindTarget(auto_target)(Before)
+    from tilelang import logpass
+    logpass("before tir.transform.LowerTVMBuiltin", mod)
     mod = tl.transform.LowerTileOp()(mod)
-    mod = tvm.tir.transform.Simplify()(mod)
-    ref_mod = tvm.tir.transform.BindTarget(auto_target)(After)
-    ref_mod = tvm.tir.transform.Simplify()(ref_mod)
-    # Note(tzj): The structures are equal except the argument in "T.reads" function.
-    # The difference is just between the first index and the indices range, which is totally equivalent
-    tvm.ir.structural_equal(mod, ref_mod)
+    logpass("after tl.transform.LowerTileOp", mod)
+    # mod = tvm.tir.transform.Simplify()(mod)
+    # ref_mod = tvm.tir.transform.BindTarget(auto_target)(After)
+    # ref_mod = tvm.tir.transform.Simplify()(ref_mod)
+    # # Note(tzj): The structures are equal except the argument in "T.reads" function.
+    # # The difference is just between the first index and the indices range, which is totally equivalent
+    # tvm.ir.structural_equal(mod, ref_mod)
     # tvm.ir.assert_structural_equal(mod, ref_mod)
 
 

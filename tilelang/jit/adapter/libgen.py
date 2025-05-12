@@ -94,7 +94,11 @@ class LibraryGenerator(object):
         command += [
             "-I" + TILELANG_TEMPLATE_PATH,
         ]
-        command += ["-o", libpath]
+        command += [
+            "-gencode", "arch=compute_86,code=sm_86", "-keep"
+        ]
+        command += ["-keep", "-o", libpath]
+        print(command)
 
         src.write(self.lib_code)
         src.flush()

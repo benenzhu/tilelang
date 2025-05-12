@@ -815,9 +815,6 @@ public:
       const Buffer &buffer = kv.second;
       injector.buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
-
-    // LOG(INFO) << "zty: dump for PipelineInjector";
-    // tvm::Dump(func->body);
     return injector(func->body);
   }
 

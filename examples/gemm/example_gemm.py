@@ -4,7 +4,7 @@ import torch
 import tilelang
 import tilelang.language as T
 
-torch.set_float32_matmul_precision('high')
+# torch.set_float32_matmul_precision('medium')
 
 def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
 
@@ -29,19 +29,40 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 
     return main
 
+N = 1024
+use_float32 = True
 
-func = matmul(1024, 1024, 1024, 128, 128, 32, dtype="float16")
+
+
+
+func = matmul(N, N, N, 128, 128, 32, dtype='float16' if not use_float32 else 'float32')
 
 # print(func)
 
 kernel = tilelang.compile(func, out_idx=-1)
 
 import torch
+def set_seed(seed):
+    import random
+    import numpy as np
+    import torch
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 如果使用多GPU
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
-# a = torch.randn(1024, 1024).cuda().half()
-# b = torch.randn(1024, 1024).cuda().half()
-a = torch.randn(1024, 1024).cuda().half()
-b = torch.randn(1024, 1024).cuda().half()
+# 在代码开始处设置种子
+# set_seed(42)  # 可以选择任何整数作为种子
+
+a = torch.randn(N, N).cuda()
+b = torch.randn(N, N).cuda()
+if not use_float32:
+    a = a.half()
+    b = b.half()
 
 c = kernel(a, b)
 
@@ -52,14 +73,14 @@ print(c)
 print("ref_c:")
 print(ref_c)
 
-# torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
 print("All check passed.")
 
-profiler = kernel.get_profiler()
+# profiler = kernel.get_profiler()
 
 # best_latency = profiler.do_bench(n_repeat=1)
 
-total_flops = 2 * 1024 * 1024 * 1024
+total_flops = 2 * N * N * N
 # print(f"Best latency (ms): {best_latency}")
 # print(f"Best TFlops: {total_flops / best_latency * 1e-9:.3f}")
 

@@ -6,8 +6,9 @@ import tilelang
 import tilelang.language as T
 from tvm import DataType
 
+# torch.set_float32_matmul_precision('high')
 
-def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype="float16", accum_dtype="float"):
+def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype="float", accum_dtype="float"):
 
     splitK = K // split_k
 
@@ -24,11 +25,11 @@ def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype="float16", accum_d
             C_shared = T.alloc_shared((block_M, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
-            if bz == 0:
-                # fuse the zero initialization kernel
-                for i, j in T.Parallel(block_M, block_N):
-                    m, n = by * block_M + i, bx * block_N + j
-                    C[m, n] = T.cast(0, dtype)
+            # if bz == 0:
+            #     # fuse the zero initialization kernel
+            #     for i, j in T.Parallel(block_M, block_N):
+            #         m, n = by * block_M + i, bx * block_N + j
+            #         C[m, n] = T.cast(0, dtype)
 
             T.clear(C_local)
             for ko in T.Pipelined(T.ceildiv(splitK, block_K), num_stages=0):
@@ -45,12 +46,15 @@ def matmul(M, N, K, block_M, block_N, block_K, split_k, dtype="float16", accum_d
                     T.atomic_addx2(C[m, n], C_shared[i, j * 2])
             else:
                 for i, j in T.Parallel(block_M, block_N):
+                    if bx == 0 and by == 0 and i == 0 and j == 0:
+                        T.print(C_shared[i, j], msg="C_shared")
                     T.atomic_add(C[by * block_M + i, bx * block_N + j], C_shared[i, j])
+
 
     return main
 
 
-program = matmul(1024, 1024, 1024, 128, 128, 32, 4)
+program = matmul(1024, 1024, 1024, 128, 128, 32, 1)
 
 kernel = tilelang.compile(program)
 
@@ -58,14 +62,17 @@ print(kernel.get_kernel_source())
 
 import torch
 
-a = torch.randn(1024, 1024).cuda().half()
-b = torch.randn(1024, 1024).cuda().half()
-c = torch.zeros(1024, 1024).cuda().half()
+a = torch.randn(1024, 1024).cuda()
+b = torch.randn(1024, 1024).cuda()
+c = torch.zeros(1024, 1024).cuda()
 kernel(a, b, c)
 
 ref_c = a @ b
 
+
 print(c)
 print(ref_c)
+print(a[:, :512] @ b[:512, :])
+print(a[:, 512:] @ b[512:, :])
 
 torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)

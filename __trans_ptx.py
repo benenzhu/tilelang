@@ -12,49 +12,51 @@ def process_ptx_with_source(in_ptx):
     out_ptx = os.path.splitext(in_ptx)[0] + "_anote.ptx"
     
     # 从PTX文件中提取源文件路径
-    source_path = None
+    source_path = {}
     for line in ptx_lines:
         file_match = re.match(r'\s*\.file\s+(\d+)\s+"([^"]+)"', line)
         if file_match:
             file_idx = int(file_match.group(1))
-            if file_idx == 1:  # 通常第一个文件是主源文件
-                source_path = file_match.group(2)
-                break
+            # if file_idx == 1:  # 通常第一个文件是主源文件
+            assert file_idx not in source_path, f"{file_idx}, {source_path[file_idx]}"
+            source_path[file_idx] = file_match.group(2)
     
-    # 如果在PTX中找不到源文件路径，尝试从debug_info部分提取
-    if not source_path:
-        for i, line in enumerate(ptx_lines):
-            if ".section	.debug_info" in line:
-                # 在debug_info部分查找源文件路径
-                for j in range(i, min(i+50, len(ptx_lines))):
-                    path_match = re.search(r'/[^\s]+\.py', ptx_lines[j])
-                    if path_match:
-                        source_path = path_match.group(0)
-                        break
-                if source_path:
-                    break
+    # # 如果在PTX中找不到源文件路径，尝试从debug_info部分提取
+    # if not source_path:
+    #     for i, line in enumerate(ptx_lines):
+    #         if ".section	.debug_info" in line:
+    #             # 在debug_info部分查找源文件路径
+    #             for j in range(i, min(i+50, len(ptx_lines))):
+    #                 path_match = re.search(r'/[^\s]+\.py', ptx_lines[j])
+    #                 if path_match:
+    #                     source_path = path_match.group(0)
+    #                     break
+    #             if source_path:
+    #                 break
     
     # 如果仍然找不到源文件，尝试从文件名推断
-    if not source_path:
-        print("Warning: Could not find source file path in PTX. Using a default path.")
-        # 尝试从PTX文件名推断源文件
-        base_name = os.path.basename(in_ptx).replace("triton_kernel_", "").replace(".ptx", ".py")
-        possible_paths = [
-            f"/A/code/triton/__zzdump/{base_name}",
-            f"./{base_name}"
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                source_path = path
-                break
+    # if not source_path:
+    #     print("Warning: Could not find source file path in PTX. Using a default path.")
+    #     # 尝试从PTX文件名推断源文件
+    #     base_name = os.path.basename(in_ptx).replace("triton_kernel_", "").replace(".ptx", ".py")
+    #     possible_paths = [
+    #         f"/A/code/triton/__zzdump/{base_name}",
+    #         f"./{base_name}"
+    #     ]
+    #     for path in possible_paths:
+    #         if os.path.exists(path):
+    #             source_path = path
+    #             break
     
-    if not source_path or not os.path.exists(source_path):
-        print(f"Warning: Source file {source_path} not found. Proceeding without source annotations.")
-        source_code = []
-    else:
-        # 读取原始源代码
-        with open(source_path, 'r') as f:
-            source_code = f.readlines()
+    # if not source_path or not os.path.exists(source_path):
+    #     print(f"Warning: Source file {source_path} not found. Proceeding without source annotations.")
+    #     source_code = []
+    # else:
+    #     # 读取原始源代码
+    source_code = {}
+    for idx, name in source_path.items():
+        with open(name, 'r') as f:
+            source_code[idx] = f.readlines()
     
     # 处理每一行 PTX
     output = []
@@ -68,18 +70,22 @@ def process_ptx_with_source(in_ptx):
             col_no = int(loc_match.group(3))
             
             # 这里假设 file_idx=1 对应我们的 Python 文件
-            if file_idx == 1 and 0 <= line_no - 1 < len(source_code):
-                source_line = source_code[line_no - 1].rstrip()
-                
-                # 添加列位置标记
-                if col_no >= 0 and col_no < len(source_line):
-                    # 创建一个指向列位置的标记
-                    col_marker = ' ' * col_no + '^'
-                    output.append(f"// Source {line_no:3d}: {source_line}\n")
-                    output.append(f"//        {col_no :3d}: {col_marker}\n")
-                else:
-                    output.append(f"// Source Line {line_no:3d}: {source_line}\n")
-                    output.append(f"// Column Wrong here..\n")
+            # if file_idx == 1 and 0 <= line_no - 1 < len(source_code):
+            source_line = source_code[file_idx][line_no - 1].rstrip()
+            
+            # 添加列位置标记
+            if col_no >= 0 and col_no < len(source_line):
+                # 创建一个指向列位置的标记
+                col_marker = ' ' * col_no + '^'
+                output.append(f"// SourcePath: []({source_path[file_idx]}:{line_no:3d})\n")
+                output.append(f"// Source {line_no:3d}: {source_line}\n")
+                output.append(f"//        {col_no :3d}: {col_marker}\n")
+            else:
+                output.append(f"// Source Line {line_no:3d}: {source_line}\n")
+                output.append(f"// Column Wrong here..\n")
+            # else:
+            #     print(f"{file_idx=}")
+            #     output.append(f"// !!!!!!!!!!!!!!!!!!!! UNKNOW here...\n")
         else: 
             # 保留原始行
             output.append(line)

@@ -105,3 +105,4 @@ core.*
 final.cu
 pass.py
 nohup.*
+__compare/*

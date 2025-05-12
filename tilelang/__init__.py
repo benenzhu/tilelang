@@ -127,3 +127,16 @@ def logpass(*msg) -> None:
     # print(f"\n\n\n\n\n--------------------------------------------------------\n", flush=True)
     # print(f'{os.getcwd()}/{filename.split("/")[-1]}:{linenum}:\n', *msg, flush=True)
     # print(' ', end = "", flush=True)
+
+def log(*msg) -> None:
+    import sys
+    import os
+    try:
+        raise Exception
+    except:
+        linenum = sys.exc_info()[2].tb_frame.f_back.f_lineno
+        filename = sys.exc_info()[2].tb_frame.f_back.f_code.co_filename
+
+    print(f"\n\n\n\n\n--------------------------------------------------------\n", flush=True)
+    print(f'{os.getcwd()}/{filename.split("/")[-1]}:{linenum}:\n', *msg, flush=True)
+    print(' ', end = "", flush=True)
