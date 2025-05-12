@@ -98,7 +98,7 @@ public:
 
   std::string DebugOutput() const final;
 
-  Fragment SetThreadRange(Range thread_range);
+  Fragment BindThreadRange(Range thread_range) const;
 
   Range ThreadRange() const { return thread_range_; }
 
