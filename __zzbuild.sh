@@ -1,13 +1,16 @@
+rm -rf build
 mkdir build 
 cp 3rdparty/tvm/cmake/config.cmake build
 cd build
-# echo "set(USE_LLVM ON)" >> config.cmake
+#echo "set(USE_LLVM /A/tilelang_origin/3rdparty/clang+llvm-17.0.2-x86_64-linux-gnu-ubuntu-22.04/bin/llvm-config)" >> config.cmake
 echo "set(USE_CUDA ON)" >> config.cmake 
 echo "set(USE_RELAY_DEBUG ON)" >> config.cmake
 echo "set(CMAKE_BUILD_TYPE Debug)" >> config.cmake
+echo "set(USE_GTEST OFF)" >> config.cmake
+# echo "set(CMAKE_CUDA_ARCHITECTURES all-major)" >> config.cmake
 # or echo "set(USE_ROCM ON)" >> config.cmake to enable ROCm runtime
 cmake -DCMAKE_BUILD_TYPE=Debug ..
-mold -run make -j46
+mold -run make -j
 
 exit 0
 
