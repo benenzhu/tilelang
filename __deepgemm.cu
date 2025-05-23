@@ -13,8 +13,8 @@
 extern "C" __global__ void main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, __grid_constant__ const CUtensorMap C_desc, float* __restrict__ scales_a, float* __restrict__ scales_b);
 extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(__grid_constant__ const CUtensorMap A_desc, __grid_constant__ const CUtensorMap B_desc, __grid_constant__ const CUtensorMap C_desc, float* __restrict__ scales_a, float* __restrict__ scales_b) {
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
-  bfloat16_t C_local[16];
-  bfloat16_t C_local_accum[16];
+  float C_local[128];
+  float C_local_accum[128];
   __shared__ uint64_t _mbarrier[18];
   if (((int)threadIdx.x) == 0) {
     tl::prefetch_tma_descriptor(A_desc);
@@ -47,15 +47,15 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(__grid_constant
       tl::mbarrier_wait(_mbarrier[((k & 3) + 8)], (((k & 7) >> 2) ^ 1));
       if (((int)threadIdx.x) == 128) {
         tl::mbarrier_expect_tx(_mbarrier[(k & 3)], 16384);
-        tl::tma_load(A_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 16384) + 10240)])), (k * 128), (((int)blockIdx.y) * 128));
+        tl::tma_load(A_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 16384) + 67584)])), (k * 128), (((int)blockIdx.y) * 128));
         tl::mbarrier_expect_tx(_mbarrier[(k & 3)], 16384);
-        tl::tma_load(A_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 16384) + 10240)])), (k * 128), (((int)blockIdx.y) * 128));
-        tl::mbarrier_expect_tx(_mbarrier[(k & 3)], 2048);
-        tl::tma_load(B_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 2048) + 2048)])), (k * 128), (((int)blockIdx.x) * 16));
+        tl::tma_load(A_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 16384) + 67584)])), (k * 128), (((int)blockIdx.y) * 128));
+        tl::mbarrier_expect_tx(_mbarrier[(k & 3)], 16384);
+        tl::tma_load(B_desc, _mbarrier[(k & 3)], (&(((fp8_e4_t*)buf_dyn_shmem)[(((k & 3) * 16384) + 2048)])), (k * 128), (((int)blockIdx.x) * 128));
       }
       tl::mbarrier_arrive(_mbarrier[(k & 3)]);
       tl::mbarrier_wait(_mbarrier[((k & 3) + 12)], (((k & 7) >> 2) ^ 1));
-      ((float*)buf_dyn_shmem)[((((k & 3) * 128) + ((int)threadIdx.x)) - 128)] = (scales_a[((((((int)blockIdx.y) * 8192) + (((int)threadIdx.x) * 64)) + k) - 8192)] * scales_b[(((((int)blockIdx.x) >> 3) * 64) + k)]);
+      ((float*)buf_dyn_shmem)[((((k & 3) * 128) + ((int)threadIdx.x)) - 128)] = (scales_a[((((((int)blockIdx.y) * 8192) + (((int)threadIdx.x) * 64)) + k) - 8192)] * scales_b[((((int)blockIdx.x) * 64) + k)]);
       tl::fence_proxy_async();
       tl::mbarrier_cp_async_arrive(_mbarrier[((k & 3) + 4)]);
       tl::mbarrier_arrive(_mbarrier[((k & 3) + 4)]);
@@ -64,56 +64,47 @@ extern "C" __global__ void __launch_bounds__(256, 1) main_kernel(__grid_constant
     tl::warpgroup_reg_alloc<240>();
     const dim3 blockIdx = tl::rasterization2DRow<10>();
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      *(uint1*)(C_local + (i * 2)) = make_uint1(__pack_nv_bfloat162(bfloat16_t(0.000000e+00f), bfloat16_t(0.000000e+00f)));
+    for (int i = 0; i < 64; ++i) {
+      *(float2*)(C_local + (i * 2)) = make_float2(0.000000e+00f, 0.000000e+00f);
     }
     #pragma unroll
-    for (int i_1 = 0; i_1 < 8; ++i_1) {
-      *(uint1*)(C_local_accum + (i_1 * 2)) = make_uint1(__pack_nv_bfloat162(bfloat16_t(0.000000e+00f), bfloat16_t(0.000000e+00f)));
+    for (int i_1 = 0; i_1 < 64; ++i_1) {
+      *(float2*)(C_local_accum + (i_1 * 2)) = make_float2(0.000000e+00f, 0.000000e+00f);
     }
     for (int k_1 = 0; k_1 < 64; ++k_1) {
       tl::mbarrier_wait(_mbarrier[(k_1 & 3)], ((k_1 & 7) >> 2));
-      tl::gemm_ss<128, 16, 128, 4, 1, 0, 1, 0, true>((&(((fp8_e4_t*)buf_dyn_shmem)[(((k_1 & 3) * 16384) + 10240)])), (&(((fp8_e4_t*)buf_dyn_shmem)[(((k_1 & 3) * 2048) + 2048)])), (&(C_local[0])));
+      tl::gemm_ss<128, 128, 128, 4, 1, 0, 1, 0, true>((&(((fp8_e4_t*)buf_dyn_shmem)[(((k_1 & 3) * 16384) + 67584)])), (&(((fp8_e4_t*)buf_dyn_shmem)[(((k_1 & 3) * 16384) + 2048)])), (&(C_local[0])));
       tl::mbarrier_arrive(_mbarrier[((k_1 & 3) + 8)]);
       tl::mbarrier_wait(_mbarrier[((k_1 & 3) + 4)], ((k_1 & 7) >> 2));
       #pragma unroll
-      for (int i_2 = 0; i_2 < 8; ++i_2) {
-        uint1 __1;
-        float2 __2;
-          float2 __3;
-          uint1 v_ = *(uint1*)(C_local_accum + (i_2 * 2));
-          __3.x = (float)(((nv_bfloat162*)(&(v_.x)))->x);
-          __3.y = (float)(((nv_bfloat162*)(&(v_.x)))->y);
-          float2 __4;
-            float2 __5;
-            uint1 v__1 = *(uint1*)(C_local + (i_2 * 2));
-            __5.x = (float)(((nv_bfloat162*)(&(v__1.x)))->x);
-            __5.y = (float)(((nv_bfloat162*)(&(v__1.x)))->y);
-            float2 v__2 = make_float2(((float*)buf_dyn_shmem)[((((((k_1 & 3) * 128) + ((i_2 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((i_2 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((float*)buf_dyn_shmem)[((((((k_1 & 3) * 128) + ((i_2 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((i_2 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);
-            __4.x = (__5.x*v__2.x);
-            __4.y = (__5.y*v__2.y);
-          __2.x = (__3.x+__4.x);
-          __2.y = (__3.y+__4.y);
-        ((nv_bfloat162*)(&(__1.x)))->x = (bfloat16_t)(__2.x);
-        ((nv_bfloat162*)(&(__1.x)))->y = (bfloat16_t)(__2.y);
-        *(uint1*)(C_local_accum + (i_2 * 2)) = __1;
+      for (int i_2 = 0; i_2 < 64; ++i_2) {
+        float2 __1;
+          float2 v_ = *(float2*)(C_local_accum + (i_2 * 2));
+          float2 __2;
+            float2 v__1 = *(float2*)(C_local + (i_2 * 2));
+            float2 v__2 = make_float2(((float*)buf_dyn_shmem)[((((((k_1 & 3) * 128) + ((i_2 >> 5) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((i_2 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))], ((float*)buf_dyn_shmem)[((((((k_1 & 3) * 128) + ((i_2 >> 5) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((i_2 & 1) * 8)) + ((((int)threadIdx.x) & 31) >> 2))]);
+            __2.x = (v__1.x*v__2.x);
+            __2.y = (v__1.y*v__2.y);
+          __1.x = (v_.x+__2.x);
+          __1.y = (v_.y+__2.y);
+        *(float2*)(C_local_accum + (i_2 * 2)) = __1;
       }
       tl::fence_proxy_async();
       tl::mbarrier_arrive(_mbarrier[((k_1 & 3) + 12)]);
       #pragma unroll
-      for (int i_3 = 0; i_3 < 8; ++i_3) {
-        *(uint1*)(C_local + (i_3 * 2)) = make_uint1(__pack_nv_bfloat162(bfloat16_t(0.000000e+00f), bfloat16_t(0.000000e+00f)));
+      for (int i_3 = 0; i_3 < 64; ++i_3) {
+        *(float2*)(C_local + (i_3 * 2)) = make_float2(0.000000e+00f, 0.000000e+00f);
       }
     }
     tl::syncthreads_partial(_mbarrier[16]);
     #pragma unroll
-    for (int i_4 = 0; i_4 < 2; ++i_4) {
-      tl::ptx_stmatrix_x4((&(((bfloat16_t*)buf_dyn_shmem)[(((((i_4 * 1024) + ((((int)threadIdx.x) >> 5) * 256)) + ((((int)threadIdx.x) & 15) * 16)) + (((((int)threadIdx.x) & 31) >> 4) * 8)) + 1024)])), __pack_half2(C_local_accum[(i_4 * 8)], C_local_accum[((i_4 * 8) + 1)]), __pack_half2(C_local_accum[((i_4 * 8) + 2)], C_local_accum[((i_4 * 8) + 3)]), __pack_half2(C_local_accum[((i_4 * 8) + 4)], C_local_accum[((i_4 * 8) + 5)]), __pack_half2(C_local_accum[((i_4 * 8) + 6)], C_local_accum[((i_4 * 8) + 7)]));
+    for (int i_4 = 0; i_4 < 64; ++i_4) {
+      *(float2*)(((float*)buf_dyn_shmem) + ((((((((i_4 >> 5) * 8192) + ((((int)threadIdx.x) >> 5) * 2048)) + ((i_4 & 1) * 1024)) + (((((int)threadIdx.x) & 31) >> 2) * 128)) + (((i_4 & 31) >> 1) * 8)) + ((((int)threadIdx.x) & 3) * 2)) + 16896)) = *(float2*)(C_local_accum + (i_4 * 2));
     }
     tl::fence_proxy_async();
     tl::syncthreads_partial(_mbarrier[17]);
     if (((int)threadIdx.x) == 0) {
-      tl::tma_store(C_desc, (&(((bfloat16_t*)buf_dyn_shmem)[1024])), (((int)blockIdx.x) * 16), (((int)blockIdx.y) * 128));
+      tl::tma_store(C_desc, (&(((float*)buf_dyn_shmem)[16896])), (((int)blockIdx.x) * 128), (((int)blockIdx.y) * 128));
       tl::tma_store_arrive();
       tl::tma_store_wait<0>();
     }
@@ -131,16 +122,16 @@ extern "C" const char* get_last_error() {
 extern "C" int init() {
     error_buf[0] = '\0';
     
-    cudaError_t result_main_kernel = cudaFuncSetAttribute(main_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 75776);
+    cudaError_t result_main_kernel = cudaFuncSetAttribute(main_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 133120);
     if (result_main_kernel != CUDA_SUCCESS) {
-        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size to %d with error: %s", 75776, cudaGetErrorString(result_main_kernel));
+        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size to %d with error: %s", 133120, cudaGetErrorString(result_main_kernel));
         return -1;
     }
 
     return 0;
 }
 
-extern "C" int call(fp8_e4_t* __restrict__ A, fp8_e4_t* __restrict__ B, bfloat16_t* __restrict__ C, float* __restrict__ scales_a, float* __restrict__ scales_b, cudaStream_t stream=cudaStreamDefault) {
+extern "C" int call(fp8_e4_t* __restrict__ A, fp8_e4_t* __restrict__ B, float* __restrict__ C, float* __restrict__ scales_a, float* __restrict__ scales_b, cudaStream_t stream=cudaStreamDefault) {
 
 	CUtensorMap A_desc;
 	CUtensorMapDataType A_desc_type= (CUtensorMapDataType)0;
@@ -171,7 +162,7 @@ extern "C" int call(fp8_e4_t* __restrict__ A, fp8_e4_t* __restrict__ B, bfloat16
 	void *B_desc_globalAddress= B;
 	cuuint64_t B_desc_globalDim[2]= {8192,1024};
 	cuuint64_t B_desc_globalStride[2]= {1,8192};
-	cuuint32_t B_desc_boxDim[2]= {128,16};
+	cuuint32_t B_desc_boxDim[2]= {128,128};
 	cuuint32_t B_desc_elementStrides[2]= {1,1};
 	CUtensorMapInterleave B_desc_interleave= (CUtensorMapInterleave)0;
 	CUtensorMapSwizzle B_desc_swizzle= (CUtensorMapSwizzle)3;
@@ -189,12 +180,12 @@ extern "C" int call(fp8_e4_t* __restrict__ A, fp8_e4_t* __restrict__ B, bfloat16
 	}
 
 	CUtensorMap C_desc;
-	CUtensorMapDataType C_desc_type= (CUtensorMapDataType)9;
+	CUtensorMapDataType C_desc_type= (CUtensorMapDataType)7;
 	cuuint32_t C_desc_tensorRank= 2;
 	void *C_desc_globalAddress= C;
 	cuuint64_t C_desc_globalDim[2]= {1024,1024};
-	cuuint64_t C_desc_globalStride[2]= {2,2048};
-	cuuint32_t C_desc_boxDim[2]= {16,128};
+	cuuint64_t C_desc_globalStride[2]= {4,4096};
+	cuuint32_t C_desc_boxDim[2]= {128,128};
 	cuuint32_t C_desc_elementStrides[2]= {1,1};
 	CUtensorMapInterleave C_desc_interleave= (CUtensorMapInterleave)0;
 	CUtensorMapSwizzle C_desc_swizzle= (CUtensorMapSwizzle)0;
@@ -210,7 +201,7 @@ extern "C" int call(fp8_e4_t* __restrict__ A, fp8_e4_t* __restrict__ B, bfloat16
 		snprintf(error_buf, ERROR_BUF_SIZE, "%s", ss.str().c_str());
 		return -1;
 	}
-	main_kernel<<<dim3(64, 8, 1), dim3(256, 1, 1), 75776, stream>>>(A_desc, B_desc, C_desc, scales_a, scales_b);
+	main_kernel<<<dim3(8, 8, 1), dim3(256, 1, 1), 133120, stream>>>(A_desc, B_desc, C_desc, scales_a, scales_b);
 	TILELANG_CHECK_LAST_ERROR("main_kernel");
 
 	return 0;
