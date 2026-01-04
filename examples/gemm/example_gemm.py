@@ -27,12 +27,13 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 
 def main():
-    kernel = matmul(1024, 1024, 1024, 128, 128, 32)
+    M, N, K = 8192, 8192, 8192
+    kernel = matmul(M, N, K, 128, 128, 32)
 
     import torch
 
-    a = torch.randn(1024, 1024).cuda().half()
-    b = torch.randn(1024, 1024).cuda().half()
+    a = torch.randn(M, K).cuda().half()
+    b = torch.randn(K, N).cuda().half()
 
     c = kernel(a, b)
 
@@ -54,7 +55,9 @@ def main():
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti")
     # latency = profiler.do_bench()
+
     print(f"tilelang Latency: {latency}ms")
+    print(f"tilelang flops: {2 * M * N * K / latency / 1e9} TFLOPS")
 
 
 def run_regression_perf():
