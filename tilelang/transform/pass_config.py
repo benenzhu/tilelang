@@ -76,6 +76,10 @@ class PassConfigKey(str, Enum):
     TL_AST_PRINT_ENABLE = "tl.ast_print_enable"
     """Enable TIR AST printing for debugging purposes. Default: False"""
 
+    TL_PRINT_IR_WHEN_CHANGE = "tl.print_ir_when_change"
+    """Print IR after each pass that causes a change. Similar to MLIR's 
+    MLIR_PRINT_IR_AFTER_CHANGE. Useful for debugging pass pipeline. Default: False"""
+
     TL_LAYOUT_VISUALIZATION_ENABLE = "tl.layout_visualization_enable"
     """Enable layout inference visualization. Default: False"""
 

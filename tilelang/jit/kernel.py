@@ -250,6 +250,7 @@ class JITKernel(Generic[_P, _T]):
         self.artifact = artifact
 
         # Create an adapter based on the specified execution backend.
+        print(__file__, "execution_backend: ", execution_backend)
         if execution_backend == "tvm_ffi":
             # Use TVMFFIKernelAdapter for interoperability with PyTorch via DLPack.
             # But we need to ensure that the runtime is enabled and the runtime module is not None.
