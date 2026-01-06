@@ -400,6 +400,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         if self.lazy_jit:
             kwargs.update(kwargs.pop("__tune_params", {}))
             key, kernel_args = self.func.parse_args(*args, **kwargs)
+            print(f"key: {key}")
             kernel = self._kernel_cache.get(key, None)
             if kernel is None:
                 kernel = self.compile(*args, **kwargs)
@@ -410,6 +411,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             key = self.parse_cache_key(*args, **kwargs)
             tune_params = kwargs.pop("__tune_params", {})
             kernel = self._kernel_cache.get(key, None)
+            print("kernel", kernel)
             if kernel is None:
                 kernel = self.compile(*args, **kwargs, **tune_params)
                 self._kernel_cache[key] = kernel

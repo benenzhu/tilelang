@@ -161,6 +161,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
     ):
+        print(__file__, __name__)
         adapter = cls.__new__(cls)
         adapter.params = params
         adapter.result_idx = adapter._legalize_result_idx(result_idx)
@@ -190,6 +191,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         adapter.lib_generator = LibraryGenerator(adapter.target, verbose=verbose)
         adapter.lib_generator.assign_pass_configs(pass_configs)
         adapter.lib_generator.assign_compile_flags(compile_flags)
+        print("kernel_lib_path", kernel_lib_path)
         adapter.lib = adapter.lib_generator.load_lib(lib_path=kernel_lib_path)
 
         adapter.lib.get_last_error.restype = ctypes.c_char_p
