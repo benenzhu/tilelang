@@ -98,6 +98,7 @@ class LibraryGenerator:
             arch = get_rocm_arch(rocm_path)
             command = [
                 "hipcc",
+                "-Rpass-analysis=kernel-resource-usage",
                 "-std=c++17",
                 "-fPIC",
                 f"--offload-arch={arch}",

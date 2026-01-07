@@ -158,7 +158,7 @@ def get_best_config(M, N, K, with_roller=False):
             skip_check=False,
         )
     )
-    return autotuner.run(warmup=3, rep=20)
+    return autotuner.run(warmup=10, rep=100)
 
 
 def get_heuristic_config() -> dict:
@@ -237,7 +237,7 @@ def run_regression_perf(M: int = 4096, N: int = 4096, K: int = 4096):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autotuned MatMul Benchmark")
-    parser.add_argument("--m", type=int, default=4096, help="Matrix dimension M")
+    parser.add_argument("--m", type=int, default=4864, help="Matrix dimension M")
     parser.add_argument("--n", type=int, default=4096, help="Matrix dimension N")
     parser.add_argument("--k", type=int, default=4096, help="Matrix dimension K")
     parser.add_argument("--use_autotune", action="store_true", default=False, help="Whether to use autotune for matmul configs")
