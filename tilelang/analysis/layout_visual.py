@@ -4,6 +4,7 @@ from tvm.tir import PyStmtExprVisitor
 
 from tvm.tir.transform import prim_func_pass
 from tilelang.tools.plot_layout import plot_layout
+from tilelang.tools.plot_shared_layout import plot_shared_layout, print_shared_layout_format
 
 
 def print_fragment_format(layout: T.Fragment) -> str:
@@ -32,12 +33,14 @@ def print_fragment_format(layout: T.Fragment) -> str:
 @tir.functor.visitor
 class _LayoutVisualVisitor(PyStmtExprVisitor):
     """
-    User-friendly pass which visualizes fragment layouts inferred during compilation.
+    User-friendly pass which visualizes fragment and shared memory layouts
+    inferred during compilation.
 
-    In TileLang, Fragment layouts describe:
-    - How logical indices (e.g., [i, j]) map to thread IDs
-    - How logical indices map to register file locations within each thread
-    - The shape transformation from input dimensions to output dimensions
+    In TileLang:
+    - Fragment layouts describe how logical indices map to thread IDs and
+      register file locations (for local/register buffers like C_local)
+    - Shared memory layouts describe swizzle patterns for bank conflict
+      avoidance (for shared buffers like A_shared, B_shared)
 
     This pass generates two types of output:
     1. Textual output: A human-readable description printed to console
@@ -66,14 +69,41 @@ class _LayoutVisualVisitor(PyStmtExprVisitor):
             layout_map = op.annotations["layout_map"]
 
             for key, layout in layout_map.items():
+                # Get buffer name from key
+                if hasattr(key, "name"):
+                    key_name = key.name
+                else:
+                    key_name = str(key)
+
+                # Use buffer name for dedup (not layout content)
+                # This ensures each buffer gets its own visualization even if layouts are identical
+                if key_name in self.processed_layouts:
+                    continue
+
                 if isinstance(layout, T.Fragment):
-                    layout_id = str(layout)
-                    if layout_id not in self.processed_layouts:
-                        print(f"{key} inferenced layout:")
-                        print_fragment_format(layout)
-                        for fmt in self.formats_list:
-                            plot_layout(layout, name=f"{key}_layout", formats=fmt)
-                        self.processed_layouts.add(layout_id)
+                    continue
+                    # Handle Fragment layout (register/local buffers)
+                    print(f"{key_name} inferenced layout:")
+                    print_fragment_format(layout)
+                    for fmt in self.formats_list:
+                        plot_layout(layout, name=f"{key_name}_layout", formats=fmt)
+                    self.processed_layouts.add(key_name)
+
+                elif isinstance(layout, T.Layout):
+                    # Handle Layout (shared memory buffers with swizzle)
+                    # Get element size from buffer dtype
+                    element_bits = 16  # default to bfloat16/float16
+                    if hasattr(key, "dtype"):
+                        import tvm
+
+                        dtype = tvm.DataType(key.dtype)
+                        element_bits = dtype.bits
+
+                    print(f"{key_name} shared memory layout:")
+                    print_shared_layout_format(layout, name=key_name)
+                    for fmt in self.formats_list:
+                        plot_shared_layout(layout, name=f"{key_name}_layout", formats=fmt, element_bits=element_bits)
+                    self.processed_layouts.add(key_name)
 
         # super().visit_block_(op)
 

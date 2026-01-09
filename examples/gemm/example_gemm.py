@@ -1,3 +1,4 @@
+# %%
 import tilelang
 import tilelang.language as T
 
@@ -26,7 +27,14 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
     return gemm
 
 
-@tilelang.jit(out_idx=[-1], verbose=True)
+@tilelang.jit(
+    out_idx=[-1],
+    verbose=True,
+    pass_configs={
+        tilelang.PassConfigKey.TL_LAYOUT_VISUALIZATION_ENABLE: True,
+        tilelang.PassConfigKey.TL_LAYOUT_VISUALIZATION_FORMATS: "png",
+    },
+)
 def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
     @T.prim_func
     def gemm(
