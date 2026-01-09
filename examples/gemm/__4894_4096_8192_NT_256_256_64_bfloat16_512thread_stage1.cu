@@ -9,53 +9,55 @@
 extern "C" __global__ void __launch_bounds__(512)
     gemm_kernel(bfloat16_t *__restrict__ A, bfloat16_t *__restrict__ B,
                 bfloat16_t *__restrict__ C) {
+  // M = 4894, N = 4096, K = 8192
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
+  // constexpr int __regs_C__128 = 256 * 256 / 512;
   float C_local[128];
+  // A norm
   bfloat16_t A_local[16];
+  // B trans.
   bfloat16_t B_local[32];
-#pragma unroll
+  #pragma unroll
   for (int i = 0; i < 32; ++i) {
     *(float4 *)(C_local + (i * 4)) =
         make_float4(0.000000e+00f, 0.000000e+00f, 0.000000e+00f, 0.000000e+00f);
   }
-#pragma unroll
+  #pragma unroll
+  // A: g2s
+  // 256  2**8
   for (int i_1 = 0; i_1 < 4; ++i_1) {
-    tl::cp_async_gs<16>(
+    tl::cp_async_gs<16>( // float4. copy
         (&(((bfloat16_t *)buf_dyn_shmem)
                [i_1 * 4096 + ((int)threadIdx.x >> 3) * 64 +
-                ((((int)threadIdx.x & 63) >> 5) +
-                     (((int)threadIdx.x & 7) >> 2) &
-                 1) *
-                    32 +
-                ((((int)threadIdx.x & 31) >> 4) +
-                     (((int)threadIdx.x & 3) >> 1) &
-                 1) *
-                    16 +
-                ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) *
-                    8])),
+                ((((int)threadIdx.x & 63) >> 5) + (((int)threadIdx.x & 7) >> 2) & 1) * 32 +
+                ((((int)threadIdx.x & 31) >> 4) + (((int)threadIdx.x & 3) >> 1) & 1) * 16 +
+                ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) * 8])),
         (&(A[(int)blockIdx.y * 2097152 + i_1 * 524288 +
              ((int)threadIdx.x >> 3) * 8192 + ((int)threadIdx.x & 7) * 8])));
   }
-#pragma unroll
+  #pragma unroll
+  // B: g2s
   for (int i_2 = 0; i_2 < 4; ++i_2) {
-    tl::cp_async_gs<16>(
+    tl::cp_async_gs<16>( // float4. copy
         (&(((bfloat16_t *)buf_dyn_shmem)
                [i_2 * 4096 + ((int)threadIdx.x >> 3) * 64 +
-                ((((int)threadIdx.x & 63) >> 5) +
-                     (((int)threadIdx.x & 7) >> 2) &
-                 1) *
-                    32 +
-                ((((int)threadIdx.x & 31) >> 4) +
-                     (((int)threadIdx.x & 3) >> 1) &
-                 1) *
-                    16 +
-                ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) *
-                    8 +
+                ((((int)threadIdx.x & 63) >> 5) + (((int)threadIdx.x & 7) >> 2) & 1) * 32 +
+                ((((int)threadIdx.x & 31) >> 4) + (((int)threadIdx.x & 3) >> 1) & 1) * 16 +
+                ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) * 8 +
                 16384])),
         (&(B[(int)blockIdx.x * 2097152 + i_2 * 524288 +
              ((int)threadIdx.x >> 3) * 8192 + ((int)threadIdx.x & 7) * 8])));
   }
   tl::cp_async_commit();
+  /*
+    主循环...
+
+
+
+
+
+
+  */
   for (int k = 0; k < 127; ++k) {
     tl::cp_async_wait<0>();
     __syncthreads();
@@ -67,9 +69,7 @@ extern "C" __global__ void __launch_bounds__(512)
                       ((int)threadIdx.x & 15) * 64 +
                       ((((int)threadIdx.x & 7) >> 2) + (ki >> 1) & 1) * 32 +
                       ((((int)threadIdx.x & 3) >> 1) + (ki & 1) & 1) * 16 +
-                      ((((int)threadIdx.x & 63) >> 5) + ((int)threadIdx.x & 1) &
-                       1) *
-                          8 +
+                      ((((int)threadIdx.x & 63) >> 5) + ((int)threadIdx.x & 1) & 1) * 8 +
                       (((int)threadIdx.x & 31) >> 4) * 4));
       }
       for (int j = 0; j < 8; ++j) {
@@ -79,9 +79,7 @@ extern "C" __global__ void __launch_bounds__(512)
                       ((int)threadIdx.x & 15) * 64 +
                       ((((int)threadIdx.x & 7) >> 2) + (ki >> 1) & 1) * 32 +
                       ((((int)threadIdx.x & 3) >> 1) + (ki & 1) & 1) * 16 +
-                      ((((int)threadIdx.x & 63) >> 5) + ((int)threadIdx.x & 1) &
-                       1) *
-                          8 +
+                      ((((int)threadIdx.x & 63) >> 5) + ((int)threadIdx.x & 1) & 1) * 8 +
                       (((int)threadIdx.x & 31) >> 4) * 4 + 16384));
       }
       for (int i_4 = 0; i_4 < 4; ++i_4) {
@@ -97,44 +95,27 @@ extern "C" __global__ void __launch_bounds__(512)
       }
     }
     __syncthreads();
-#pragma unroll
+    #pragma unroll
     for (int i_5 = 0; i_5 < 4; ++i_5) {
       tl::cp_async_gs<16>(
           (&(((bfloat16_t *)
                   buf_dyn_shmem)[i_5 * 4096 + ((int)threadIdx.x >> 3) * 64 +
-                                 ((((int)threadIdx.x & 63) >> 5) +
-                                      (((int)threadIdx.x & 7) >> 2) &
-                                  1) *
-                                     32 +
-                                 ((((int)threadIdx.x & 31) >> 4) +
-                                      (((int)threadIdx.x & 3) >> 1) &
-                                  1) *
-                                     16 +
-                                 ((((int)threadIdx.x & 15) >> 3) +
-                                      ((int)threadIdx.x & 1) &
-                                  1) *
-                                     8])),
+                                 ((((int)threadIdx.x & 63) >> 5) + (((int)threadIdx.x & 7) >> 2) & 1) * 32 +
+                                 ((((int)threadIdx.x & 31) >> 4) + (((int)threadIdx.x & 3) >> 1) & 1) * 16 +
+                                 ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) * 8
+                                ])),
           (&(A[(int)blockIdx.y * 2097152 + i_5 * 524288 +
                ((int)threadIdx.x >> 3) * 8192 + k * 64 +
                ((int)threadIdx.x & 7) * 8 + 64])));
     }
-#pragma unroll
+    #pragma unroll
     for (int i_6 = 0; i_6 < 4; ++i_6) {
       tl::cp_async_gs<16>(
           (&(((bfloat16_t *)
                   buf_dyn_shmem)[i_6 * 4096 + ((int)threadIdx.x >> 3) * 64 +
-                                 ((((int)threadIdx.x & 63) >> 5) +
-                                      (((int)threadIdx.x & 7) >> 2) &
-                                  1) *
-                                     32 +
-                                 ((((int)threadIdx.x & 31) >> 4) +
-                                      (((int)threadIdx.x & 3) >> 1) &
-                                  1) *
-                                     16 +
-                                 ((((int)threadIdx.x & 15) >> 3) +
-                                      ((int)threadIdx.x & 1) &
-                                  1) *
-                                     8 +
+                                 ((((int)threadIdx.x & 63) >> 5) + (((int)threadIdx.x & 7) >> 2) & 1) * 32 +
+                                 ((((int)threadIdx.x & 31) >> 4) + (((int)threadIdx.x & 3) >> 1) & 1) * 16 +
+                                 ((((int)threadIdx.x & 15) >> 3) + ((int)threadIdx.x & 1) & 1) * 8 +
                                  16384])),
           (&(B[(int)blockIdx.x * 2097152 + i_6 * 524288 +
                ((int)threadIdx.x >> 3) * 8192 + k * 64 +
