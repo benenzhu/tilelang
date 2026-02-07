@@ -37,7 +37,9 @@ dependencies = [
     "numpy>=1.23.5",
     "psutil",
     "torch",
-    "torch>=2.7; platform_system == 'Darwin'",
+    "torch>=2.4; platform_system == 'Darwin'",
+    # jit-compiling a torch extension needs setuptools
+    "setuptools; platform_system == 'Darwin'",
     "tqdm>=4.62.3",
     "typing-extensions>=4.10.0",
     "z3-solver>=4.13.0",
@@ -49,10 +51,15 @@ dependencies = [
 fp4 = ["ml-dtypes>=0.5.1"]
 # if you want to enable layout inference visualization
 vis = ["matplotlib"]
+# if you want to build with CUDA NVCC support
+nvcc = [
+    "nvidia-cuda-nvcc>=13.0.48",
+    "nvidia-cuda-cccl>=13.0.50",
+]
 
 [build-system]
 requires = [
-    "cython>=3.0.0",
+    "cython>=3.1.0",
     "scikit-build-core",
     "z3-solver>=4.13.0",
     # Not for auditwheel, explicitly add patchelf for repairing libz3.so.
@@ -119,6 +126,7 @@ tilelang = "tilelang"
 "tilelang/3rdparty/tvm/src" = "3rdparty/tvm/src"
 "tilelang/3rdparty/tvm/python" = "3rdparty/tvm/python"
 "tilelang/3rdparty/tvm/include" = "3rdparty/tvm/include"
+"tilelang/3rdparty/tvm/3rdparty/dmlc-core/include" = "3rdparty/tvm/3rdparty/dmlc-core/include"
 "tilelang/3rdparty/tvm/version.py" = "3rdparty/tvm/version.py"
 # CUTLASS
 "tilelang/3rdparty/cutlass/include" = "3rdparty/cutlass/include"
@@ -257,10 +265,11 @@ esac
 
 cudaver="$(echo "${CUDA_VERSION:-$DEFAULT_CUDA_VERSION}" | cut -d '.' -f-2)"
 v="${cudaver//./-}"
-yum install -y "cuda-minimal-build-${v}" "cuda-driver-devel-${v}" "cuda-nvrtc-devel-${v}" nvidia-driver-cuda-libs
-yum clean all
+dnf install -y "cuda-minimal-build-${v}" "cuda-driver-devel-${v}" "cuda-nvrtc-devel-${v}"
+dnf clean all
 """
 repair-wheel-command = [
+    # Do not bundle libtvm_ffi.so and libz3.so because they are shipped by the dependency packages.
     "auditwheel -v repair --exclude libtvm_ffi.so --exclude libz3.so --exclude libcuda.so.1 --exclude '/usr/local/cuda*' -w {dest_dir} {wheel}",
     "pipx run abi3audit --verbose --strict {wheel}",
 ]

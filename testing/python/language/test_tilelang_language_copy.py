@@ -29,7 +29,6 @@ def run_tilelang_copy(M=1024, N=1024, block_M=128, block_N=128, dtype=T.float16)
     kernel = tilelang.compile(
         program,
         out_idx=[1],
-        target="cuda",
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True, tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True},
     )
     source = kernel.get_kernel_source()
@@ -66,7 +65,6 @@ def run_tilelang_copy_with_stride(M=1024, N=1024, NN=2048, block_M=128, block_N=
     kernel = tilelang.compile(
         program,
         out_idx=[1],
-        target="cuda",
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -131,7 +129,6 @@ def run_tilelang_copy_buffer_load_with_parallel(M=1024, N=1024, block_M=128, blo
     kernel = tilelang.compile(
         program,
         out_idx=[1],
-        target="cuda",
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True, tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True},
     )
     a = torch.randn(M, N, device="cuda", dtype=getattr(torch, dtype))
@@ -171,8 +168,10 @@ def run_tilelang_copy_fp4(M=1024, N=1024, block_M=128, block_N=128, src_dtype=T.
     source = kernel.get_kernel_source()
     assert "fp4_e2_t" in source
     # For FP4, use same shape as kernel expects, since int8 is used as storage type
-    dummy_input = torch.randint(0, 100, (M, N), device="cuda", dtype=torch.int8)
+    dummy_input = torch.randint(0, 100, (M, N // 2), device="cuda", dtype=torch.int8)
     output = kernel(dummy_input)
+    if src_dtype == dst_dtype:
+        assert torch.allclose(output.view(torch.int8), dummy_input)
     assert output is not None
 
 

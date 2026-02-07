@@ -1,6 +1,7 @@
 import tilelang.language as T
 from tilelang import tvm as tvm
 import tilelang.testing
+from tilelang.utils import determine_fp8_type
 import pytest
 
 
@@ -147,8 +148,8 @@ def test_gemm_ss_fp8_cuda(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeA
 @pytest.mark.parametrize(
     "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
     [
-        (128, 128, 128, True, True, T.float8_e5m2fnuz, T.float8_e5m2fnuz, T.float32, 128, 128, 32, 2, 128),
-        (128, 128, 128, True, True, T.float8_e4m3fnuz, T.float8_e4m3fnuz, T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, True, True, determine_fp8_type("e5m2"), determine_fp8_type("e5m2"), T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, True, True, determine_fp8_type(), determine_fp8_type(), T.float32, 128, 128, 32, 2, 128),
     ],
 )
 def test_gemm_ss_fp8_rocm(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
@@ -436,22 +437,19 @@ def run_gemm_sr(
 @pytest.mark.parametrize(
     "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
     [
-        # (512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
-        # (512, 1024, 768, False, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
-        # (512, 1024, 768, True, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
-        # (512, 1024, 768, True, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
-        # (128, 16, 32, False, True, T.float16, T.float16, T.float32, 128, 16, 32, 0, 128),
-        # TODO: There is precision problem when num_stages=2 on ROCm
-        # (128, 128, 32, False, True, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
-        # (128, 128, 32, False, False, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
-
-        # (128, 128, 32, True, False, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
-        # (128, 128, 32, True, True, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
-        # (128, 128, 128, False, False, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
-        # (128, 128, 128, False, True, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
-        # TODO: There is precision problem needs to repair on ROCm
+        (512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, False, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (128, 16, 32, False, True, T.float16, T.float16, T.float32, 128, 16, 32, 0, 128),
+        (128, 128, 32, False, True, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
+        (128, 128, 32, False, False, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
+        (128, 128, 32, True, False, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
+        (128, 128, 32, True, True, T.int8, T.int8, T.int32, 128, 128, 32, 2, 128),
+        (128, 128, 128, False, False, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, False, True, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
         (128, 128, 128, True, False, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
-        # (128, 128, 128, True, True, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, True, True, T.float, T.float, T.float32, 128, 128, 32, 2, 128),
     ],
 )
 def test_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
@@ -481,6 +479,30 @@ def test_gemm_sr_fp8_cuda(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeA
         # TODO: There is precision problem needs to repair
         # (128, 128, 128, True, True, T.float8_e5m2fnuz, T.float8_e5m2fnuz, T.float32, 128, 128, 32, 2, 128),
         (128, 128, 128, True, True, T.float8_e4m3fnuz, T.float8_e4m3fnuz, T.float32, 128, 128, 32, 2, 128),
+    ],
+)
+def test_gemm_sr_fp8_rocm(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        (128, 128, 128, True, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 32, 2, 128),
+    ],
+)
+def test_gemm_sr_fp8_cuda(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
+
+
+@tilelang.testing.requires_rocm
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        # TODO: There is precision problem needs to repair
+        # (128, 128, 128, True, True, determine_fp8_type("e5m2"), determine_fp8_type("e5m2"), T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, True, True, determine_fp8_type(), determine_fp8_type(), T.float32, 128, 128, 32, 2, 128),
     ],
 )
 def test_gemm_sr_fp8_rocm(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
@@ -644,7 +666,7 @@ def test_gemm_rr_fp8_cuda(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeA
     [
         # TODO: There is precision problem needs to repair
         # (128, 128, 128, True, True, T.float8_e5m2fnuz, T.float8_e5m2fnuz, T.float32, 128, 128, 32, 2, 128),
-        (128, 128, 128, True, True, T.float8_e4m3fnuz, T.float8_e4m3fnuz, T.float32, 128, 128, 32, 2, 128),
+        (128, 128, 128, True, True, determine_fp8_type(), determine_fp8_type(), T.float32, 128, 128, 32, 2, 128),
     ],
 )
 def test_gemm_rr_fp8_rocm(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):

@@ -98,6 +98,54 @@ def matmul_jit_kernel(
     return main
 
 
+def matmul_kernel_with_barrier(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    mbars,
+    trans_A,
+    trans_B,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    num_stages,
+    threads,
+):
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
+    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor(A_shape, in_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            barriers = T.alloc_barrier(mbars)  # noqa: F841
+            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                if trans_A:
+                    T.copy(A[k * block_K, by * block_M], A_shared)
+                else:
+                    T.copy(A[by * block_M, k * block_K], A_shared)
+                if trans_B:
+                    T.copy(B[bx * block_N, k * block_K], B_shared)
+                else:
+                    T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, trans_A, trans_B)
+            T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
 def run_gemm_jit_kernel(
     M,
     N,
@@ -155,6 +203,7 @@ def run_gemm_jit_kernel(
     tilelang.testing.torch_assert_close(C, ref_C, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda
 def test_gemm_jit_kernel():
     run_gemm_jit_kernel(
         512,
@@ -206,6 +255,7 @@ def run_cutedsl_kernel_do_bench(
     assert tvm_latency is not None
 
 
+@tilelang.testing.requires_cuda
 def test_cutedsl_kernel_do_bench():
     run_cutedsl_kernel_do_bench(512, 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
 
@@ -248,6 +298,7 @@ def run_cutedsl_kernel_multi_stream(
             matmul_kernel(tensor_a, tensor_b, tensor_c)
 
 
+@tilelang.testing.requires_cuda
 def test_cutedsl_kernel_multi_stream():
     run_cutedsl_kernel_multi_stream(512, 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
 
@@ -297,6 +348,7 @@ def run_cutedsl_dynamic_shape(
     tilelang.testing.torch_assert_close(tensor_c, tensor_ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
+@tilelang.testing.requires_cuda
 def test_cutedsl_dynamic_shape():
     run_cutedsl_dynamic_shape(T.dynamic("m"), 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
 
@@ -305,6 +357,51 @@ def test_cutedsl_dynamic_shape():
     run_cutedsl_dynamic_shape(
         T.dynamic("m"), T.dynamic("n"), T.dynamic("k"), False, False, "float16", "float16", "float16", 128, 256, 32, 2
     )
+
+
+def run_cutedsl_barrier(
+    M,
+    N,
+    K,
+    block_M,
+    block_N,
+    block_K,
+    mbars,
+    trans_A,
+    trans_B,
+    in_dtype,
+    out_dtype,
+    accum_dtype,
+    num_stages,
+    threads,
+):
+    program = matmul_kernel_with_barrier(
+        M,
+        N,
+        K,
+        block_M,
+        block_N,
+        block_K,
+        mbars,
+        trans_A,
+        trans_B,
+        in_dtype,
+        out_dtype,
+        accum_dtype,
+        num_stages,
+        threads,
+    )
+    matmul_kernel = tilelang.compile(program, target="cutedsl")
+
+    assert f"barriers = tl.alloc_smem(cutlass.Uint64, size_in_elems={len(mbars)})" in matmul_kernel.get_kernel_source()
+    for i, arrive_count in enumerate(mbars):
+        assert f"tl.mbarrier_init(barriers[{i}], {arrive_count})" in matmul_kernel.get_kernel_source()
+
+
+@tilelang.testing.requires_cuda
+def test_cutedsl_barrier():
+    mbars = (1, 1, 128, 128)
+    run_cutedsl_barrier(512, 1024, 768, 128, 256, 32, mbars, False, False, "float16", "float16", "float16", 2, 128)
 
 
 def check_hopper():

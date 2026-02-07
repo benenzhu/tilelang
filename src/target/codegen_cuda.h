@@ -11,6 +11,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "target/source/codegen_c.h"
 
@@ -65,6 +66,7 @@ public:
                               const PrimFunc &func, std::ostream &os);
 
 protected:
+  void ReserveKeywordsAsUnique_();
   virtual std::string GetBufferRef(DataType t, const BufferNode *buffer,
                                    PrimExpr index) final;
   void PrintCallExtern(Type ret_type, ffi::String global_symbol,
@@ -89,7 +91,8 @@ private:
   // Global barrier expected node.
   std::string vid_global_barrier_expect_;
   // Global curand state
-  std::string curand_philox_state;
+  std::string curand_random_generator_state;
+  std::string curand_random_generator_state_type;
 
   // whether enable fp16
   bool enable_fp16_{false};
@@ -136,6 +139,7 @@ private:
   // The size of the barrier array in shared memory
   int barrier_count_ = -1;
   // The name of the mbarrier array in shared memory
+  // The same as injected_mbarrier_name_ in transform/common/mbarrier.h
   const std::string mbarrier_name_ = "mbarrier";
   // The type name of the mbarrier array
   const std::string mbarrier_dtype_ = "Barrier";
@@ -146,6 +150,8 @@ private:
   std::unordered_map<const VarNode *, std::string> fragment_shapes;
   std::unordered_map<const VarNode *, std::string> fragment_layouts;
   std::unordered_map<const VarNode *, IntImm> unroll_factor;
+  // Map from VarNode to packed buffer variable name for fp4 packed storage
+  std::unordered_map<const VarNode *, std::string> fp4_packed_buffers_;
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangCUDA *p);
   void PrintWmmaScope(const std::string &scope, DataType t,

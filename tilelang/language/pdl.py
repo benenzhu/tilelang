@@ -7,15 +7,15 @@ __all__ = [
 ]
 
 
-def pdl_trigger():
-    return tir.call_extern(
-        "int32",  # cudaError_t
-        "cudaTriggerProgrammaticLaunchCompletion",
+def pdl_trigger() -> tir.PrimExpr:
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.pdl_trigger"),
     )
 
 
-def pdl_sync():
-    return tir.call_extern(
-        "int32",  # cudaError_t
-        "cudaGridDependencySynchronize",
+def pdl_sync() -> tir.PrimExpr:
+    return tir.call_intrin(
+        "void",
+        tir.op.Op.get("tl.pdl_sync"),
     )
