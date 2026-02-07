@@ -213,6 +213,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
     print_pass(mod, "AddWrapperForSingleBufStore")
     # Normalize negative indices to canonical non-negative form
+    mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+    # Verify parallel loop correctness
+    if should_enable_race_check():
+        mod = tilelang.transform.VerifyParallelLoop()(mod)
 
     # Inject assumes to speedup tvm prover
     mod = tilelang.transform.InjectAssumes()(mod)
@@ -232,7 +236,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LowerTileOp()(mod)
     print_pass(mod, "LowerTileOp")
     # Lower l2 persistent map
-
+    mod = tilelang.transform.LowerL2Persistent()(mod)
+    # Decouple type cast vectorization constraints before vectorization
+    mod = tilelang.transform.DecoupleTypeCast()(mod)
     # Legalize vectorized loops to ensure they are valid
     mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
     print_pass(mod, "LegalizeVectorizedLoop")
