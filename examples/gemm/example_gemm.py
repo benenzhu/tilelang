@@ -97,6 +97,7 @@ def main(transpose_b=False):
 
     print(f"tilelang Latency: {latency}ms")
     print(f"tilelang flops: {2 * M * N * K / latency / 1e9} TFLOPS")
+    print(f"shape: {M}x{N}x{K}")
 
 
 def run_regression_perf():
