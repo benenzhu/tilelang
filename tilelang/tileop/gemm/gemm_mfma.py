@@ -13,6 +13,31 @@ from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
 
 
+def _is_gfx950() -> bool:
+    """Detect whether the current device is GFX950 via torch."""
+    try:
+        import torch
+        if torch.version.hip is None or not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        return gcn_arch.startswith("gfx950")
+    except Exception:
+        return False
+
+
+def _get_mfma_k_dim(target: Target, in_dtype: str) -> int | None:
+    """Return the MFMA k-dimension override for GFX950, or None for default."""
+    if target.kind.name != "hip":
+        return None
+    if not _is_gfx950():
+        return None
+    # GFX950 supports 16x16x32 MFMA for bf16 and f16
+    if in_dtype in ("bfloat16", "float16"):
+        return 32
+    return None
+
+
 class GemmMFMA(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MFMA)
@@ -30,6 +55,7 @@ class GemmMFMA(GemmBase):
             warp_col_tiles=warp_col_tiles,
             chunk=self.chunk,
             k_pack=self.k_pack,
+            mfma_k_dim=_get_mfma_k_dim(target, self.in_dtype),
         )
 
         if self.is_gemm_ss():
@@ -77,6 +103,7 @@ class GemmMFMA(GemmBase):
             chunk=self.chunk,
             thread_var=thread_var,
             k_pack=self.k_pack,
+            mfma_k_dim=_get_mfma_k_dim(target, self.in_dtype),
         )
 
         in_dtype = self.in_dtype

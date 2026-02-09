@@ -51,7 +51,7 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_shared)
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
+                T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
             
             T.copy(C_local, C[by * block_M, bx * block_N])
     
@@ -66,7 +66,7 @@ def main(transpose_b=False):
         assert False, "not implemented"
         kernel = matmul(M, N, K, 128, 128, 32)
     else:
-        kernel = matmul_nt(M, N, K, 128, 128, 64)
+        kernel = matmul_nt(M, N, K, 256, 256, 64)
 
     import torch
 

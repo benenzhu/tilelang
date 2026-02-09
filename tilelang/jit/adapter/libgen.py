@@ -101,6 +101,8 @@ class LibraryGenerator:
                 "-std=c++17",
                 "-fPIC",
                 "-Rpass-analysis=kernel-resource-usage",
+                "--save-temps",
+                "-s",
                 f"--offload-arch={arch}",
                 "--shared",
                 src.name,

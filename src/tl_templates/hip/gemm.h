@@ -29,8 +29,10 @@ template <> struct MfmaTraits<half> {
   }
 };
 
-// Specialization for bfloat16_t
-template <> struct MfmaTraits<bfloat16_t> {
+// Specialization for bfloat16_t (CDNA2/3: 16x16x16, vec_size=4)
+template <int KDim = 16> struct MfmaBf16Traits;
+
+template <> struct MfmaBf16Traits<16> {
   template <typename AccType>
   static TL_DEVICE void mfma_op(const bfloat16_t *b, const bfloat16_t *a,
                                 AccType *c) {
@@ -46,8 +48,37 @@ template <> struct MfmaTraits<bfloat16_t> {
       a_vec[i] = a_short[i];
     }
 
-    // Call the intrinsic and store the result directly to c
+    // CDNA2/3: __builtin_amdgcn_mfma_f32_16x16x16bf16_1k
     *c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(b_vec, a_vec, *c, 0, 0, 0);
+  }
+};
+
+// GFX950: 16x16x32, vec_size=8
+template <> struct MfmaBf16Traits<32> {
+  template <typename AccType>
+  static TL_DEVICE void mfma_op(const bfloat16_t *b, const bfloat16_t *a,
+                                AccType *c) {
+    bfloat16x8_vec b_vec, a_vec;
+
+    short *b_short = reinterpret_cast<short *>(const_cast<bfloat16_t *>(b));
+    short *a_short = reinterpret_cast<short *>(const_cast<bfloat16_t *>(a));
+
+    for (int i = 0; i < 8; ++i) {
+      b_vec[i] = b_short[i];
+      a_vec[i] = a_short[i];
+    }
+
+    // GFX950: __builtin_amdgcn_mfma_f32_16x16x32_bf16
+    *c = __builtin_amdgcn_mfma_f32_16x16x32_bf16(b_vec, a_vec, *c, 0, 0, 0);
+  }
+};
+
+// Default MfmaTraits for bfloat16_t uses CDNA2/3 variant
+template <> struct MfmaTraits<bfloat16_t> {
+  template <typename AccType>
+  static TL_DEVICE void mfma_op(const bfloat16_t *b, const bfloat16_t *a,
+                                AccType *c) {
+    MfmaBf16Traits<16>::mfma_op(b, a, c);
   }
 };
 

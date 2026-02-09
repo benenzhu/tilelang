@@ -79,6 +79,7 @@ class MatrixCoreIntrinEmitter:
         is_m_first: bool | None = False,
         b_preshuffle: bool | None = False,
         thread_var: Var | None = None,
+        mfma_k_dim: int | None = None,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -91,7 +92,7 @@ class MatrixCoreIntrinEmitter:
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
-        self._initialize_k_dim(a_dtype)
+        self._initialize_k_dim(a_dtype, mfma_k_dim)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
         self._initialize_mfma_prefix(self.k_dim)
@@ -107,7 +108,11 @@ class MatrixCoreIntrinEmitter:
         self.num_elems_per_byte = num_elems_per_byte
         self.thread_var = thread_var
 
-    def _initialize_k_dim(self, a_dtype=T.float16):
+    def _initialize_k_dim(self, a_dtype=T.float16, mfma_k_dim: int | None = None):
+        if mfma_k_dim is not None:
+            self.k_dim = mfma_k_dim
+            return
+
         if isinstance(a_dtype, str):
             if a_dtype in ["float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz", T.int8]:
                 self.k_dim = 32
@@ -156,8 +161,18 @@ class MatrixCoreIntrinEmitter:
         elif in_dtype_abbrv == "i8":
             self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_i8"
         elif in_dtype_abbrv == "bf16":
-            # HIP intrinsic uses ...x{K}bf16_1k without an underscore before bf16
-            self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}bf16_1k"
+            if k_dim == 32:
+                # GFX950: __builtin_amdgcn_mfma_f32_16x16x32_bf16
+                self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_bf16"
+            else:
+                # CDNA2/3: __builtin_amdgcn_mfma_f32_16x16x16bf16_1k
+                self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}bf16_1k"
+        elif in_dtype_abbrv == "f16":
+            if k_dim == 32:
+                # GFX950: __builtin_amdgcn_mfma_f32_16x16x32_f16
+                self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}_f16"
+            else:
+                self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}{in_dtype_abbrv}"
         else:
             self.mfma_suffix = f"{out_dtype_abbrv}_{M_DIM}x{N_DIM}x{k_dim}{in_dtype_abbrv}"
 
@@ -697,6 +712,7 @@ class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
         a_preshuffle: bool | None = False,
         b_preshuffle: bool | None = False,
         thread_var: Var | None = None,
+        mfma_k_dim: int | None = None,
     ):
         super().__init__(
             a_dtype=a_dtype,
@@ -714,6 +730,7 @@ class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):
             k_pack=k_pack,
             is_m_first=is_m_first,
             thread_var=thread_var,
+            mfma_k_dim=mfma_k_dim,
         )
         self._initialize_preshuffle(a_preshuffle, b_preshuffle)
 
