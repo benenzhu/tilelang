@@ -45,7 +45,8 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # Enable rasterization for better L2 cache locality
-            T.use_swizzle(panel_size=10)
+            # num_xcds=8 for MI300X XCD remap (set to 0 or omit on CUDA)
+            T.use_swizzle(panel_size=4, num_xcds=8)
 
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):

@@ -16,12 +16,35 @@ __all__ = [
 ]
 
 
-def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
-    """Annotate a kernel to use a specific threadblock swizzle pattern."""
-    device_func = "rasterization2DRow" if order == "row" else "rasterization2DColumn"
+def use_swizzle(panel_size: int, order: str = "row", enable: bool = True, num_xcds: int = 0):
+    """Annotate a kernel to use a specific threadblock swizzle pattern.
+
+    Parameters
+    ----------
+    panel_size : int
+        Width of the panel (group-M size) for the L2 cache swizzle.
+    order : str
+        "row" or "column" — selects Row-major or Column-major panel layout.
+    enable : bool
+        Set to False to disable swizzle entirely.
+    num_xcds : int
+        Number of XCDs (chiplets) for AMD MI-series GPUs.
+        When > 0, an XCD remap is applied before the panel swizzle so that
+        ``panel_size²`` consecutive workgroups land on the same XCD,
+        reducing cross-chiplet traffic.
+        Typical values: 8 for MI300X, 2 for MI250X.
+        0 (default) disables XCD remap.
+    """
     if not enable:
         return None
-    return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}>")
+    if num_xcds > 0:
+        suffix = "Xcd"
+        tparams = f"<{panel_size}, {num_xcds}>"
+    else:
+        suffix = ""
+        tparams = f"<{panel_size}>"
+    device_func = ("rasterization2DRow" if order == "row" else "rasterization2DColumn") + suffix
+    return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}{tparams}")
 
 
 def annotate_layout(layout_map: dict):

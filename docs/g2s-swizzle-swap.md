@@ -120,7 +120,66 @@ __shared__ __align__(1024) bfloat16_t B_shared_dyn[32768];
 | `tilelang/jit/adapter/wrapper.py` | HIP launch smem_size=0 | ✅ |
 | `src/transform/lower_device_kernel_launch.cc` | 支持多个 `shared.dyn` 分配（累加大小） | ✅ |
 
-## 5. 相关文件参考
+## 5. 优化 TODO
+
+### 5.1 热循环中 buffer_resource 构造开销过大
+
+**现象**：在主计算循环内部，每次 `buffer_load_dwordx4 ... lds` 前都要执行大量 SGPR/VGPR 指令来构造 buffer resource descriptor（`s[0:3]`）和计算 voffset。典型序列：
+
+```asm
+v_readfirstlane_b32 s0, v150      ; copy.h:29  — 构造 rsrc.base_lo
+v_readfirstlane_b32 s1, v151      ; copy.h:30  — 构造 rsrc.base_hi
+v_subrev_u32_e32 v146, s0, v150   ; copy.h:128 — 计算 voffset
+s_mov_b32 m0, s19                 ; copy.h:131 — 设置 LDS 写入地址
+buffer_load_dwordx4 v146, s[0:3], 0 offen lds  ; copy.h:132
+```
+
+**优化思路**：buffer resource descriptor 的 base address 在整个 kernel 内不变（只依赖 kernel 参数），`soffset`/`voffset` 随 k 迭代线性增长。应当：
+- 在循环外提前构造好 `s[0:3]` resource descriptor（一次性）
+- 循环内只更新 `soffset`（`s_add` 步进）和 `m0`
+- 预期可以省掉循环内每条 load 前的 `v_readfirstlane_b32` × 2 + `v_subrev` 等指令
+
+**涉及文件**：`src/tl_templates/hip/copy.h`（`cp_async_gs` 函数）
+
+**状态**：🔲 TODO
+
+### 5.2 ds_read_b128 与 MFMA 的交错调度
+
+**现象**：当前生成代码中 `ds_read_b128`（S2R load）和 `v_mfma_f32_16x16x32_bf16` 的交错不够充分。理想情况下每条 MFMA 之间应穿插 ds_read，隐藏 LDS 读延迟：
+
+```asm
+; 理想模式（交错）
+ds_read_b128 ...
+v_mfma ...
+ds_read_b128 ...
+v_mfma ...
+
+; 当前模式（批量 read 后批量 mfma）
+ds_read_b128 ...   ×N
+s_waitcnt lgkmcnt(...)
+v_mfma ...         ×N
+```
+
+**优化思路**：这可能可以在 TIR 前端层面解决——调整 `T.copy` 和 `T.gemm` 的 lowering，让 S2R copy 和 MFMA 在 IR 层就交错排列，而非分成两个独立的 block。编译器后端（LLVM）也可能做一些调度，但前端控制更可靠。
+
+**涉及文件**：`src/op/copy.cc`、`src/op/gemm.cc`、或 pipeline 相关 transform
+
+**状态**：🔲 TODO — 明天在 GEMM 上试验
+
+## 6. XCD Remap
+
+已实现。在 `rasterization2DRow` 的 panel swizzle 之前插入 `chiplet_transform_chunked`，将连续 `panel_width²` 个 workgroup 分配到同一 XCD，减少跨 chiplet 通信。
+
+**用法**：`T.use_swizzle(panel_size=10, num_xcds=8)` — MI300X 用 8，MI250X 用 2。
+
+**涉及文件**：
+
+| 文件 | 修改 |
+|------|------|
+| `src/tl_templates/hip/threadblock_swizzle.h` | 新增 `chiplet_transform_chunked` + `rasterization2DRowXcd` / `rasterization2DColumnXcd` |
+| `tilelang/language/annotations.py` | `use_swizzle` 新增 `num_xcds` 参数 |
+
+## 7. 相关文件参考
 
 | 文件 | 作用 |
 |------|------|
