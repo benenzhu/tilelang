@@ -96,35 +96,50 @@ CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
 //   - One instruction moves 64 lanes * N bytes = 64*N bytes (1024B for N=16)
 //   - Tracked by vmcnt (truly async, data bypasses VGPRs)
 //
-// Parameters:
-//   lds_m0:   LDS byte address for the start of the contiguous block (SGPR)
-//   rsrc:     buffer resource descriptor for the global array
-//   voffset:  per-thread byte offset into the global buffer (VGPR)
-//   soffset:  wave-uniform scalar byte offset (default 0)
+// cp_async_gs<N>(lds_ptr, global_ptr) keeps the original signature so that
+// no IR/codegen changes are needed.  Internally it extracts the wave-uniform
+// m0, buffer resource, and per-lane voffset from the two pointers.
+//
+// Prerequisites (guaranteed by the LowerTileOp swizzle-swap for ROCm):
+//   - LDS addresses are contiguous per wavefront: lane k writes at
+//     lds_base + k * N  (i.e. the swizzle has been moved to the load side).
 // ============================================================================
-template <int N>
-TL_DEVICE void __todo__cp_async_gs(index_t lds_m0, int32x4_t rsrc,
-                                index_t voffset, index_t soffset = 0) {
-  static_assert(N == 4 || N == 16,
-                "buffer_load ... lds: only 4 and 16 bytes supported on gfx950");
-  asm volatile("s_mov_b32 m0, %0" : : "s"(lds_m0) : "memory");
-  llvm_amdgcn_raw_buffer_load_lds(
-      rsrc,
-      (as3_uint32_ptr)0, // LDS base via m0
-      N,                 // bytes per lane
-      voffset,
-      soffset,
-      0,                 // immediate offset
-      0                  // aux / cache policy
-  );
-}
-
-// Original synchronous G2S copy (VGPR path)
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
   if constexpr (N == 16) {
-    *(uint4 *)lds_base_ptr = *(const uint4 *)global_base_ptr;
+    // --- buffer_load_b128 ... lds  (truly async, bypasses VGPRs) ----------
+
+    // m0 = wave-uniform LDS byte offset (lane 0's value).
+    // Hardware writes to: m0 + lane_id * 16.
+    uint32_t lds_m0 = __builtin_amdgcn_readfirstlane(
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds_base_ptr)));
+
+    // Buffer resource descriptor from lane 0's global pointer.
+    // make_wave_buffer_resource internally does readfirstlane on all
+    // 128 bits, so rsrc.base = lane 0's global_base_ptr.
+    auto rsrc = make_wave_buffer_resource(global_base_ptr);
+
+    // Per-lane voffset (bytes) = this lane's global addr − lane 0's addr.
+    // Only the low 32 bits are needed; within a wavefront the delta is
+    // at most a few MB, so truncation is safe.
+    uint32_t my_lo =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(global_base_ptr));
+    uint32_t base_lo = __builtin_amdgcn_readfirstlane(my_lo);
+    uint32_t voffset = my_lo - base_lo;
+
+    // Issue the truly-async G2S transfer.
+    asm volatile("s_mov_b32 m0, %0" : : "s"(lds_m0) : "memory");
+    llvm_amdgcn_raw_buffer_load_lds(
+        rsrc,
+        (as3_uint32_ptr)0, // LDS base supplied via m0
+        N,                 // bytes per lane (16)
+        voffset,
+        0,                 // soffset
+        0,                 // immediate offset
+        0                  // aux / cache policy
+    );
   } else if constexpr (N == 8) {
+    // No buffer_load ... lds variant for 8 bytes; use VGPR path.
     *(uint2 *)lds_base_ptr = *(const uint2 *)global_base_ptr;
   } else if constexpr (N == 4) {
     async_buffer_load_dword_v(

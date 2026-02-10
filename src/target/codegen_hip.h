@@ -11,6 +11,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "target/source/codegen_c.h"
 
@@ -88,6 +89,16 @@ private:
   // The alignment of the barrier array in shared memory
   // Set to 16 to maintain minimum alignment requirements for async bulk copy
   const int barrier_alignment_bytes_ = 16;
+
+  // --- Async G2S pipeline tracking for AMD vmcnt ---
+  // On AMD, vmcnt counts individual instructions (not groups like NVIDIA).
+  // We track how many ptx_cp_async ops are issued per commit group so that
+  // ptx_wait_group(N) can be emitted as vmcnt(N * ops_per_group).
+  // Loop trip counts are tracked to account for unrolled loops containing
+  // async ops (the IR visits the op once, but it executes trip_count times).
+  int async_ops_since_commit_{0};
+  int ops_per_commit_group_{0};
+  std::vector<int> loop_trip_counts_;
 };
 
 } // namespace codegen

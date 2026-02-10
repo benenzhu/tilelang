@@ -164,9 +164,22 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
   PrintType(op->loop_var.dtype(), stream);
   stream << ' ' << vid << " = " << start << "; " << vid << " < " << extent
          << "; ++" << vid << ") {\n";
+  // Track trip count of unrolled loops for async-op counting (AMD vmcnt).
+  // Only unrolled loops contribute to instruction multiplication — the outer
+  // pipeline loop (kSerial) executes commit/wait each iteration, so its trip
+  // count does NOT multiply the per-group async op count.
+  bool track_trip =
+      (op->kind == tir::ForKind::kUnrolled) && op->extent.as<IntImmNode>();
+  if (track_trip) {
+    loop_trip_counts_.push_back(
+        static_cast<int>(op->extent.as<IntImmNode>()->value));
+  }
   int for_scope = BeginScope();
   PrintStmt(op->body);
   this->EndScope(for_scope);
+  if (track_trip) {
+    loop_trip_counts_.pop_back();
+  }
   PrintIndent();
   stream << "}\n";
 }
@@ -566,7 +579,11 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    // Use bare s_barrier (without the implicit s_waitcnt vmcnt(0) that
+    // __syncthreads() adds).  This lets the async G2S pipeline (buffer_load
+    // ... lds) overlap loads with compute — vmcnt is managed explicitly by
+    // cp_async_wait.
+    this->stream << "__builtin_amdgcn_s_barrier();\n";
   }
 }
 
@@ -782,11 +799,27 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
                    << ", " << src << ", " << condition << ");\n";
     }
+    // Track per-instruction count for AMD vmcnt computation.
+    // Multiply by enclosing loop trip counts (unrolled loops emit one IR
+    // node but produce trip_count instructions after unrolling).
+    {
+      int trip_product = 1;
+      for (int tc : loop_trip_counts_) trip_product *= tc;
+      async_ops_since_commit_ += trip_product;
+    }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
+    // Record how many async ops this commit group contains, then reset.
+    if (async_ops_since_commit_ > 0) {
+      ops_per_commit_group_ = async_ops_since_commit_;
+    }
+    async_ops_since_commit_ = 0;
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {
+    // On AMD, vmcnt counts individual instructions, not groups.
+    // Convert group count → instruction count: N_groups * ops_per_group.
     int n = Downcast<IntImm>(op->args[0])->value;
-    std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
+    int vmcnt = (ops_per_commit_group_ > 0) ? n * ops_per_commit_group_ : n;
+    std::string func_name = "tl::cp_async_wait<" + std::to_string(vmcnt) + ">";
     print_extern_call_stmt(func_name, 1);
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
