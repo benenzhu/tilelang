@@ -9,7 +9,10 @@
 extern "C" __global__ void __launch_bounds__(512)
     gemm_kernel(bfloat16_t *__restrict__ A, bfloat16_t *__restrict__ B,
                 bfloat16_t *__restrict__ C) {
-  extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
+  // HipKittens-style: separate __shared__ symbols B_smem[][], B_smem[2][] so compiler sees
+  // read [k&1] vs write [(k+1)&1] = no alias, and stays ds_read (not flat_load).
+  __shared__ __align__(1024) bfloat16_t A_smem[2][16384];
+  __shared__ __align__(1024) bfloat16_t B_smem[2][16384];
   float C_local[128];
   bfloat16_t A_local[64];
   bfloat16_t B_local[128];
@@ -24,148 +27,118 @@ extern "C" __global__ void __launch_bounds__(512)
 #pragma unroll
   for (int i_1 = 0; i_1 < 4; ++i_1) {
     tl::cp_async_gs<16>(
-        (&(((bfloat16_t *)buf_dyn_shmem)[(
-            ((((i_1 * 4096) + ((threadIdx.x >> 3) * 64)) +
-              (((((threadIdx.x & 63) >> 5) +
-                 ((threadIdx.x & 7) >> 2)) &
+        (&(A_smem[0][(i_1 * 4096) + (((int)threadIdx.x) * 8)])),
+        (&(A[((((((((int)blockIdx.y) * 2097152) + (i_1 * 524288)) +
+                 ((((int)threadIdx.x) >> 3) * 8192)) +
+                (((((((int)threadIdx.x) & 63) >> 5) +
+                   ((((int)threadIdx.x) & 7) >> 2)) &
+                  1) *
+                 32)) +
+               (((((((int)threadIdx.x) & 31) >> 4) +
+                  ((((int)threadIdx.x) & 3) >> 1)) &
+                 1) *
+                16)) +
+              (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) &
                 1) *
-               32)) +
-             (((((threadIdx.x & 31) >> 4) +
-                ((threadIdx.x & 3) >> 1)) &
-               1) *
-              16)) +
-            (((((threadIdx.x & 15) >> 3) + (threadIdx.x & 1)) &
-              1) *
-             8))])),
-        (&(A[((((((int)blockIdx.y) * 2097152) + (i_1 * 524288)) +
-               ((threadIdx.x >> 3) * 8192)) +
-              ((threadIdx.x & 7) * 8))])));
+               8))])));
   }
 #pragma unroll
   for (int i_2 = 0; i_2 < 4; ++i_2) {
     tl::cp_async_gs<16>(
-        (&(((bfloat16_t *)buf_dyn_shmem)[(
-            (((((i_2 * 4096) + ((threadIdx.x >> 3) * 64)) +
-               (((((threadIdx.x & 63) >> 5) +
-                  ((threadIdx.x & 7) >> 2)) &
+        (&(B_smem[0][(i_2 * 4096) + (((int)threadIdx.x) * 8)])),
+        (&(B[((((((((int)blockIdx.x) * 2097152) + (i_2 * 524288)) +
+                 ((((int)threadIdx.x) >> 3) * 8192)) +
+                (((((((int)threadIdx.x) & 63) >> 5) +
+                   ((((int)threadIdx.x) & 7) >> 2)) &
+                  1) *
+                 32)) +
+               (((((((int)threadIdx.x) & 31) >> 4) +
+                  ((((int)threadIdx.x) & 3) >> 1)) &
                  1) *
-                32)) +
-              (((((threadIdx.x & 31) >> 4) +
-                 ((threadIdx.x & 3) >> 1)) &
+                16)) +
+              (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) &
                 1) *
-               16)) +
-             (((((threadIdx.x & 15) >> 3) + (threadIdx.x & 1)) &
-               1) *
-              8)) +
-            32768)])),
-        (&(B[((((((int)blockIdx.x) * 2097152) + (i_2 * 524288)) +
-               ((threadIdx.x >> 3) * 8192)) +
-              ((threadIdx.x & 7) * 8))])));
-  }
-  if(0){
-    for (int i_2 = 0; i_2 < 4; ++i_2) {
-      tl::cp_async_gs<16>(
-          (&(((bfloat16_t *)buf_dyn_shmem)[(
-              ((((i_2 * 4096 + ((threadIdx.x >> 3) * 64)) +
-                 (((((threadIdx.x & 63) >> 5) + ((threadIdx.x & 7) >> 2)) & 1) * 32)) +
-                (((((threadIdx.x & 31) >> 4) + ((threadIdx.x & 3) >> 1)) & 1) * 16)) +
-               (((((threadIdx.x & 15) >> 3) + (threadIdx.x & 1)) & 1) * 8)) +
-              32768)])),
-          (&(B[((((((int)blockIdx.x) * 2097152) + (i_2 * 524288)) +
-                 ((threadIdx.x >> 3) * 8192)) +
-                ((threadIdx.x & 7) * 8))])));
-    }
+               8))])));
   }
   tl::cp_async_commit();
   for (int k = 0; k < 127; ++k) {
-    __syncthreads();
+    __builtin_amdgcn_s_barrier();
 #pragma unroll
     for (int i_3 = 0; i_3 < 4; ++i_3) {
       tl::cp_async_gs<16>(
-          (&(((bfloat16_t *)buf_dyn_shmem)[(
-              (((((((k + 1) & 1) * 16384) + (i_3 * 4096)) +
-                 ((threadIdx.x >> 3) * 64)) +
-                (((((threadIdx.x & 63) >> 5) +
-                   ((threadIdx.x & 7) >> 2)) &
-                  1) *
-                 32)) +
-               (((((threadIdx.x & 31) >> 4) +
-                  ((threadIdx.x & 3) >> 1)) &
-                 1) *
-                16)) +
-              (((((threadIdx.x & 15) >> 3) + (threadIdx.x & 1)) &
-                1) *
-               8))])),
-          (&(A[((((((((int)blockIdx.y) * 2097152) + (i_3 * 524288)) +
-                   ((threadIdx.x >> 3) * 8192)) +
+          (&(A_smem[(k + 1) & 1][(i_3 * 4096) + (((int)threadIdx.x) * 8)])),
+          (&(A[(
+              (((((((((int)blockIdx.y) * 2097152) + (i_3 * 524288)) +
+                   ((((int)threadIdx.x) >> 3) * 8192)) +
                   (k * 64)) +
-                 ((threadIdx.x & 7) * 8)) +
-                64)])));
+                 (((((((int)threadIdx.x) & 63) >> 5) +
+                    ((((int)threadIdx.x) & 7) >> 2)) &
+                   1) *
+                  32)) +
+                (((((((int)threadIdx.x) & 31) >> 4) +
+                   ((((int)threadIdx.x) & 3) >> 1)) &
+                  1) *
+                 16)) +
+               (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) &
+                 1) *
+                8)) +
+              64)])));
     }
 #pragma unroll
     for (int i_4 = 0; i_4 < 4; ++i_4) {
       tl::cp_async_gs<16>(
-          (&(((bfloat16_t *)buf_dyn_shmem)[(
-              ((((((((k + 1) & 1) * 16384) + (i_4 * 4096)) +
-                  ((threadIdx.x >> 3) * 64)) +
-                 (((((threadIdx.x & 63) >> 5) +
-                    ((threadIdx.x & 7) >> 2)) &
+          (&(B_smem[ + ((k + 1) & 1)][(i_4 * 4096) + (((int)threadIdx.x) * 8)])),
+          (&(B[(
+              (((((((((int)blockIdx.x) * 2097152) + (i_4 * 524288)) +
+                   ((((int)threadIdx.x) >> 3) * 8192)) +
+                  (k * 64)) +
+                 (((((((int)threadIdx.x) & 63) >> 5) +
+                    ((((int)threadIdx.x) & 7) >> 2)) &
                    1) *
                   32)) +
-                (((((threadIdx.x & 31) >> 4) +
-                   ((threadIdx.x & 3) >> 1)) &
+                (((((((int)threadIdx.x) & 31) >> 4) +
+                   ((((int)threadIdx.x) & 3) >> 1)) &
                   1) *
                  16)) +
-               (((((threadIdx.x & 15) >> 3) + (threadIdx.x & 1)) &
+               (((((((int)threadIdx.x) & 15) >> 3) + (((int)threadIdx.x) & 1)) &
                  1) *
                 8)) +
-              32768)])),
-          (&(B[((((((((int)blockIdx.x) * 2097152) + (i_4 * 524288)) +
-                   ((threadIdx.x >> 3) * 8192)) +
-                  (k * 64)) +
-                 ((threadIdx.x & 7) * 8)) +
-                64)])));
+              64)])));
     }
     tl::cp_async_commit();
-    tl::cp_async_wait<1>();
-    __syncthreads();
+    tl::cp_async_wait<8>();
+    __builtin_amdgcn_s_barrier();
     for (int i_5 = 0; i_5 < 4; ++i_5) {
       for (int local_id = 0; local_id < 2; ++local_id) {
-        *(uint4 *)(A_local + ((i_5 * 16) + (local_id * 8))) =
-            *(uint4 *)(((bfloat16_t *)buf_dyn_shmem) +
-                       ((((((((k & 1) * 16384) +
-                             (((threadIdx.x & 255) >> 6) * 4096)) +
-                            (i_5 * 1024)) +
-                           ((threadIdx.x & 15) * 64)) +
-                          (((((threadIdx.x & 63) >> 5) +
-                             ((threadIdx.x & 7) >> 2)) &
+        *(uint4 *)(A_local + ((i_5 * 16) + (local_id * 8))) = *(uint4 *)(&(
+            A_smem[k & 1][(((((int)threadIdx.x) & 255) >> 6) * 4096) +
+                          (i_5 * 1024) + ((((int)threadIdx.x) & 15) * 64) +
+                          (((((((int)threadIdx.x) & 63) >> 5) +
+                             ((((int)threadIdx.x) & 7) >> 2)) &
                             1) *
-                           32)) +
-                         (((((threadIdx.x & 31) >> 4) +
-                            ((threadIdx.x & 3) >> 1)) &
+                           32) +
+                          ((((((int)threadIdx.x) & 31) >> 4) +
+                            ((((int)threadIdx.x) & 3) >> 1)) &
                            1) *
-                          16)) +
-                        (((local_id + (threadIdx.x & 1)) & 1) * 8)));
+                              16 +
+                          (((local_id + (((int)threadIdx.x) & 1)) & 1) * 8)]));
       }
     }
     for (int j = 0; j < 8; ++j) {
       for (int local_id_1 = 0; local_id_1 < 2; ++local_id_1) {
-        *(uint4 *)(B_local + ((j * 16) + (local_id_1 * 8))) =
-            *(uint4 *)(((bfloat16_t *)buf_dyn_shmem) +
-                       (((((((((k & 1) * 16384) +
-                              ((threadIdx.x >> 8) * 8192)) +
-                             (j * 1024)) +
-                            ((threadIdx.x & 15) * 64)) +
-                           (((((threadIdx.x & 63) >> 5) +
-                              ((threadIdx.x & 7) >> 2)) &
-                             1) *
-                            32)) +
-                          (((((threadIdx.x & 31) >> 4) +
-                             ((threadIdx.x & 3) >> 1)) &
-                            1) *
-                           16)) +
-                         (((local_id_1 + (threadIdx.x & 1)) & 1) * 8)) +
-                        32768));
+        *(uint4 *)(B_local + ((j * 16) + (local_id_1 * 8))) = *(uint4 *)(&(
+            B_smem[ + (k & 1)]
+                  [(((int)threadIdx.x) >> 8) * 8192 + (j * 1024) +
+                   ((((int)threadIdx.x) & 15) * 64) +
+                   (((((((int)threadIdx.x) & 63) >> 5) +
+                      ((((int)threadIdx.x) & 7) >> 2)) &
+                     1) *
+                    32) +
+                   ((((((int)threadIdx.x) & 31) >> 4) +
+                     ((((int)threadIdx.x) & 3) >> 1)) &
+                    1) *
+                       16 +
+                   (((local_id_1 + (((int)threadIdx.x) & 1)) & 1) * 8)]));
       }
     }
     for (int kp = 0; kp < 2; ++kp) {
@@ -183,42 +156,15 @@ extern "C" __global__ void __launch_bounds__(512)
     }
   }
   tl::cp_async_wait<0>();
-  __syncthreads();
+  __builtin_amdgcn_s_barrier();
   for (int i_7 = 0; i_7 < 4; ++i_7) {
     for (int local_id_2 = 0; local_id_2 < 2; ++local_id_2) {
-      *(uint4 *)(A_local + ((i_7 * 16) + (local_id_2 * 8))) =
-          *(uint4 *)(((bfloat16_t *)buf_dyn_shmem) +
-                     (((((((((threadIdx.x & 255) >> 6) * 4096) +
-                           (i_7 * 1024)) +
-                          ((threadIdx.x & 15) * 64)) +
-                         (((((threadIdx.x & 63) >> 5) +
-                            ((threadIdx.x & 7) >> 2)) &
-                           1) *
-                          32)) +
-                        (((((threadIdx.x & 31) >> 4) +
-                           ((threadIdx.x & 3) >> 1)) &
-                          1) *
-                         16)) +
-                       (((local_id_2 + (threadIdx.x & 1)) & 1) * 8)) +
-                      16384));
+      *(uint4*)(A_local + ((i_7 * 16) + (local_id_2 * 8))) = *(uint4*)(&(A_smem[1][(((((int)threadIdx.x) & 255) >> 6) * 4096) + (i_7 * 1024) + ((((int)threadIdx.x) & 15) * 64) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 32) + ((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16 + (((local_id_2 + (((int)threadIdx.x) & 1)) & 1) * 8)]));
     }
   }
   for (int j_2 = 0; j_2 < 8; ++j_2) {
     for (int local_id_3 = 0; local_id_3 < 2; ++local_id_3) {
-      *(uint4 *)(B_local + ((j_2 * 16) + (local_id_3 * 8))) =
-          *(uint4 *)(((bfloat16_t *)buf_dyn_shmem) +
-                     ((((((((threadIdx.x >> 8) * 8192) + (j_2 * 1024)) +
-                          ((threadIdx.x & 15) * 64)) +
-                         (((((threadIdx.x & 63) >> 5) +
-                            ((threadIdx.x & 7) >> 2)) &
-                           1) *
-                          32)) +
-                        (((((threadIdx.x & 31) >> 4) +
-                           ((threadIdx.x & 3) >> 1)) &
-                          1) *
-                         16)) +
-                       (((local_id_3 + (threadIdx.x & 1)) & 1) * 8)) +
-                      49152));
+      *(uint4*)(B_local + ((j_2 * 16) + (local_id_3 * 8))) = *(uint4*)(&(B_smem[1][(((int)threadIdx.x) >> 8) * 8192 + (j_2 * 1024) + ((((int)threadIdx.x) & 15) * 64) + (((((((int)threadIdx.x) & 63) >> 5) + ((((int)threadIdx.x) & 7) >> 2)) & 1) * 32) + ((((((int)threadIdx.x) & 31) >> 4) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 16 + (((local_id_3 + (((int)threadIdx.x) & 1)) & 1) * 8)]));
     }
   }
   for (int kp_1 = 0; kp_1 < 2; ++kp_1) {
@@ -244,13 +190,13 @@ extern "C" __global__ void __launch_bounds__(512)
     ((bfloat16_t *)(&(__1.y)))[1] = (bfloat16_t)(v_.w);
     *(uint2 *)(C_local_cast + 0) = __1;
     *(uint2 *)(C + ((((((((((int)blockIdx.y) * 2097152) +
-                          (((threadIdx.x & 255) >> 6) * 524288)) +
+                          (((((int)threadIdx.x) & 255) >> 6) * 524288)) +
                          ((i_9 >> 3) * 131072)) +
-                        ((threadIdx.x & 15) * 8192)) +
+                        ((((int)threadIdx.x) & 15) * 8192)) +
                        (((int)blockIdx.x) * 256)) +
-                      ((threadIdx.x >> 8) * 128)) +
+                      ((((int)threadIdx.x) >> 8) * 128)) +
                      ((i_9 & 7) * 16)) +
-                    (((threadIdx.x & 63) >> 4) * 4))) =
+                    (((((int)threadIdx.x) & 63) >> 4) * 4))) =
         *(uint2 *)(C_local_cast + 0);
   }
 }
@@ -296,7 +242,7 @@ extern "C" int init() {
 extern "C" int call(bfloat16_t *__restrict__ A, bfloat16_t *__restrict__ B,
                     bfloat16_t *__restrict__ C,
                     hipStream_t stream = hipStreamDefault) {
-  gemm_kernel<<<dim3(32, 32, 1), dim3(512, 1, 1), 131072, stream>>>(A, B, C);
+  gemm_kernel<<<dim3(32, 32, 1), dim3(512, 1, 1)>>>(A, B, C);
   TILELANG_CHECK_LAST_ERROR("gemm_kernel");
 
   return 0;
