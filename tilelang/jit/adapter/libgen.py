@@ -102,7 +102,7 @@ class LibraryGenerator:
                 "-fPIC",
                 "-Rpass-analysis=kernel-resource-usage",
                 "--save-temps",
-                "-s",
+                "-g",
                 f"--offload-arch={arch}",
                 "--shared",
                 src.name,

@@ -760,9 +760,124 @@ private:
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto buffer = store->buffer;
     if (buffer_remap_.count(buffer)) {
-      auto new_indices = layout_map_[buffer]->Forward(store->indices);
+      auto layout = layout_map_[buffer];
       auto new_buffer = buffer_remap_[store->buffer];
-      layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
+      layout_remap_.Set(new_buffer, layout);
+
+      // On ROCm/HIP targets, for G2S copy (store to shared memory from global
+      // memory), swap the swizzle from the store (LDS) side to the load
+      // (global) side. This makes LDS writes sequential by thread ID,
+      // preparing for the truly async buffer_load_b128...lds instruction
+      // where hardware forces the write pattern: m0 + lane_id * N.
+      //
+      // The final LDS content is identical because we are just reassigning
+      // which thread reads which global element — the XOR swizzle is its own
+      // inverse, so the permutation of data into LDS positions is preserved.
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)) {
+        // Extract the BufferLoad from global memory.
+        // Handle patterns: BufferLoad, Cast(BufferLoad),
+        // if_then_else(pred, BufferLoad, zero).
+        const BufferLoadNode *load_node = nullptr;
+        PrimExpr store_value = store->value;
+
+        if (auto *load = store_value.as<BufferLoadNode>()) {
+          if (IsGlobalBuffer(load->buffer)) {
+            load_node = load;
+          }
+        } else if (auto *cast = store_value.as<CastNode>()) {
+          if (auto *load = cast->value.as<BufferLoadNode>()) {
+            if (IsGlobalBuffer(load->buffer)) {
+              load_node = load;
+            }
+          }
+        } else if (auto *call = store_value.as<CallNode>()) {
+          if (call->op.same_as(builtin::if_then_else()) &&
+              call->args.size() == 3) {
+            if (auto *load = call->args[1].as<BufferLoadNode>()) {
+              if (IsGlobalBuffer(load->buffer)) {
+                load_node = load;
+              }
+            }
+          }
+        }
+
+        if (load_node) {
+          // Use the flatten-space delta approach:
+          // 1. layout->Forward does reshape + swizzle (may change dims,
+          //    e.g. 2D → 3D).
+          // 2. Flatten both the swizzled physical indices and the original
+          //    logical indices into 1D offsets. The reshape terms cancel,
+          //    leaving flat_delta = swizzle(col) - col.
+          // 3. Subtract flat_delta from the last dim of the swizzled store
+          //    indices → sequential store (reshape only, no swizzle).
+          // 4. Add flat_delta to the last dim of the global load indices
+          //    → swizzle moves to the read side.
+
+          auto swizzled_store = layout->Forward(store->indices);
+
+          // Flatten swizzled physical indices using new_buffer shape.
+          PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
+          {
+            PrimExpr stride = IntImm(DataType::Int(32), 1);
+            for (int k = static_cast<int>(swizzled_store.size()) - 1; k >= 0;
+                 --k) {
+              flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
+              stride = stride * new_buffer->shape[k];
+            }
+          }
+
+          // Flatten original logical indices using original buffer shape.
+          PrimExpr flat_original = IntImm(DataType::Int(32), 0);
+          {
+            PrimExpr stride = IntImm(DataType::Int(32), 1);
+            for (int k = static_cast<int>(store->indices.size()) - 1; k >= 0;
+                 --k) {
+              flat_original = flat_original + store->indices[k] * stride;
+              stride = stride * buffer->shape[k];
+            }
+          }
+
+          PrimExpr flat_delta =
+              analyzer_->Simplify(flat_swizzled - flat_original);
+
+          // Store side: remove swizzle from the last dimension.
+          Array<PrimExpr> seq_store(swizzled_store.begin(),
+                                    swizzled_store.end());
+          int last_s = static_cast<int>(seq_store.size()) - 1;
+          seq_store.Set(last_s,
+                        analyzer_->Simplify(swizzled_store[last_s] - flat_delta));
+
+          // Load side: add swizzle to the last dimension of global indices.
+          Array<PrimExpr> new_load_indices(load_node->indices.begin(),
+                                           load_node->indices.end());
+          int last_l = static_cast<int>(new_load_indices.size()) - 1;
+          new_load_indices.Set(
+              last_l,
+              analyzer_->Simplify(load_node->indices[last_l] + flat_delta));
+
+          auto new_load = BufferLoad(load_node->buffer, new_load_indices);
+
+          // Rebuild store value preserving any wrapping (Cast /
+          // if_then_else).
+          PrimExpr new_value;
+          if (auto *cast = store_value.as<CastNode>()) {
+            new_value = Cast(cast->dtype, new_load);
+          } else if (auto *call = store_value.as<CallNode>()) {
+            // if_then_else(pred, new_load, else_value)
+            Array<PrimExpr> new_args = {call->args[0], new_load,
+                                        call->args[2]};
+            new_value = Call(call->dtype, call->op, new_args);
+          } else {
+            new_value = new_load;
+          }
+
+          // Store with sequential (un-swizzled) indices.
+          return BufferStore(new_buffer, new_value, seq_store);
+        }
+      }
+
+      // Default path: apply swizzle to store indices (original behavior).
+      auto new_indices = layout->Forward(store->indices);
       return BufferStore(new_buffer, store->value, new_indices);
     } else if (var_remap_.count(buffer->data)) {
       auto new_buffer = Buffer(
