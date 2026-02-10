@@ -4,7 +4,12 @@ from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
+
 import os
+
+
+def _is_hip_target(target: Target) -> bool:
+    return target.kind.name == "hip"
 
 
 def should_print_ir_when_change(pass_ctx: PassContext | None = None) -> bool:
@@ -369,9 +374,19 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     print_pass(mod, "AnnotateReadOnlyParams")
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
-    enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
-    print_pass(mod, "MergeSharedMemoryAllocations")
+    #
+    # HIP: skip merging so each shared buffer stays as a separate __shared__
+    # variable.  This is required for the truly-async G2S path
+    # (buffer_load_b128…lds): LLVM's alias analysis must see the LDS-read
+    # target as an "identified object" distinct from the buffer_load_lds
+    # intrinsic's dummy AS3-null write pointer.  A single merged buffer
+    # (even if declared static) is not enough — only genuinely separate
+    # __shared__ allocations achieve NoAlias, preventing the compiler from
+    # inserting spurious s_waitcnt vmcnt(0) before ds_read instructions.
+    if not _is_hip_target(target):
+        enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
+        mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
+        print_pass(mod, "MergeSharedMemoryAllocations")
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
         print_pass(mod, "InjectFenceProxy")

@@ -595,7 +595,15 @@ void CodeGenTileLangHIP::PrintStorageScope(const std::string &scope,
   if (scope == "shared") {
     os << "__shared__ ";
   } else if (scope == "shared.dyn") {
-    os << "extern __shared__ __align__(1024) ";
+    // HIP: use static __shared__ (not extern) so the buffer becomes an
+    // "identified object" in LLVM's alias analysis.  This prevents the
+    // compiler from inserting spurious s_waitcnt vmcnt(0) before ds_read
+    // instructions that follow buffer_load_b128…lds (truly-async G2S copy).
+    // With "extern __shared__" the compiler cannot prove that the
+    // buffer_load_lds write (via a dummy AS3 null pointer) does not alias
+    // the subsequent ds_read from the same extern symbol, so it
+    // conservatively waits for all VM operations to complete.
+    os << "__shared__ __align__(1024) ";
   }
 }
 
@@ -1164,7 +1172,13 @@ void CodeGenTileLangHIP::VisitStmt_(const AllocateNode *op) {
   PrintType(op->dtype, stream);
 
   if (scope == "shared.dyn") {
-    stream << ' ' << vid << "[];\n";
+    // HIP: emit a fixed-size static __shared__ array instead of a
+    // zero-length extern array.  See PrintStorageScope for rationale.
+    size_t constant_size = op->ConstantAllocationSize();
+    ICHECK_GT(constant_size, 0)
+        << "HIP shared.dyn allocation must have constant size "
+        << "to be emitted as static __shared__";
+    stream << ' ' << vid << '[' << constant_size << "];\n";
   } else {
     size_t constant_size = op->ConstantAllocationSize();
     ICHECK_GT(constant_size, 0)

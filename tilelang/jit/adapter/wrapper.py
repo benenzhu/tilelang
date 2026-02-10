@@ -312,7 +312,7 @@ class TLCUDASourceWrapper:
             grid_str = (
                 f"dim3({self._pythonic_expr(grid_info[0])}, {self._pythonic_expr(grid_info[1])}, {self._pythonic_expr(grid_info[2])})"
             )
-            smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
+            smem_str = self.get_launch_smem_size(dynamic_smem_buf)
             init_l2_persistent_map = self.generate_l2_persistent_map(function_name)
             kernel_launch_code += init_l2_persistent_map
 
@@ -364,6 +364,13 @@ class TLCUDASourceWrapper:
         # Wrap the kernel dispatch logic in an external C function
         host_func = PREDEF_HOST_FUNC.format(def_args, kernel_launch_code)
         return host_func
+
+    def get_launch_smem_size(self, dynamic_smem_buf):
+        """Return the dynamic shared memory size to pass in the kernel launch.
+
+        Subclasses (e.g. HIP) can override this to always return 0
+        when static __shared__ memory is used instead of dynamic."""
+        return 0 if dynamic_smem_buf is None else dynamic_smem_buf
 
     def get_declaration(self, declare_kernel_code: str) -> str:
         return declare_kernel_code.split(";")[0]
@@ -684,6 +691,13 @@ class TLHIPSourceWrapper(TLCUDASourceWrapper):
         # Format the initialization function using the call_str
         init_funcs = PREDEF_INIT_FUNC.format(call_str)
         return init_funcs
+
+    def get_launch_smem_size(self, dynamic_smem_buf):
+        # HIP uses static __shared__ memory (not extern/dynamic) to prevent
+        # the compiler from inserting spurious s_waitcnt vmcnt(0) before LDS
+        # reads.  The shared memory size is baked into the kernel binary, so
+        # the launch configuration must pass 0 for dynamic shared memory.
+        return 0
 
     def get_stream_type(self) -> dict[str, str]:
         return {"name": "stream=hipStreamDefault", "type": "hipStream_t"}
