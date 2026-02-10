@@ -1,0 +1,2 @@
+hipcc -std=c++17 -fPIC -Rpass-analysis=kernel-resource-usage --save-temps -g --offload-arch=gfx950 --shared __host_kernel.cpp -I/A/tilelang/3rdparty/composable_kernel/include -I/A/tilelang/3rdparty/../src -o a.so
+python /root/learn-hip/gen_pure.py __host_kernel-hip-amdgcn-amd-amdhsa-gfx950.s
