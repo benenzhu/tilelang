@@ -134,3 +134,4 @@ before
 *.out
 *.resolution.txt
 *.hipfb
+examples/gemm/__tmp.py
