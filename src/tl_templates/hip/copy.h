@@ -13,6 +13,9 @@ using index_t = u32;
 
 using ck_tile::int32x4_t;
 
+// Address-space-3 (LDS) pointer type for buffer_load ... lds intrinsic
+using as3_uint32_ptr = uint32_t __attribute__((address_space(3)))*;
+
 struct __attribute__((packed)) buffer_resource {
   const void *ptr;
   uint32_t range;
@@ -37,6 +40,18 @@ __device__ void init_m0(uint32_t m0_value) {
 __device__ void inc_m0(uint32_t m0_inc) {
   asm volatile("s_add_u32 m0, %0, m0" : : "n"(m0_inc) : "memory");
 }
+
+// LLVM intrinsic: async global-to-LDS transfer (gfx950+: supports 4/12/16 bytes)
+// On gfx950, buffer_load_b128 ... lds: each lane loads N bytes from global,
+// writes to LDS at m0 + lane_id * N.
+__device__ void
+llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,
+                                as3_uint32_ptr lds_ptr,
+                                index_t size,
+                                index_t voffset,
+                                index_t soffset,
+                                index_t offset,
+                                index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 
 namespace tl {
 
@@ -72,6 +87,39 @@ CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
                : "memory");
 }
 
+// ============================================================================
+// Truly async global-to-LDS copy using buffer_load_b128 ... lds (gfx950+)
+//
+// Hardware behaviour per instruction:
+//   - Each lane loads N bytes from global at: rsrc.base + soffset + voffset
+//   - Each lane writes N bytes to LDS at:     m0 + lane_id * N
+//   - One instruction moves 64 lanes * N bytes = 64*N bytes (1024B for N=16)
+//   - Tracked by vmcnt (truly async, data bypasses VGPRs)
+//
+// Parameters:
+//   lds_m0:   LDS byte address for the start of the contiguous block (SGPR)
+//   rsrc:     buffer resource descriptor for the global array
+//   voffset:  per-thread byte offset into the global buffer (VGPR)
+//   soffset:  wave-uniform scalar byte offset (default 0)
+// ============================================================================
+template <int N>
+TL_DEVICE void __todo__cp_async_gs(index_t lds_m0, int32x4_t rsrc,
+                                index_t voffset, index_t soffset = 0) {
+  static_assert(N == 4 || N == 16,
+                "buffer_load ... lds: only 4 and 16 bytes supported on gfx950");
+  asm volatile("s_mov_b32 m0, %0" : : "s"(lds_m0) : "memory");
+  llvm_amdgcn_raw_buffer_load_lds(
+      rsrc,
+      (as3_uint32_ptr)0, // LDS base via m0
+      N,                 // bytes per lane
+      voffset,
+      soffset,
+      0,                 // immediate offset
+      0                  // aux / cache policy
+  );
+}
+
+// Original synchronous G2S copy (VGPR path)
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
   if constexpr (N == 16) {

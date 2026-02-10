@@ -127,3 +127,10 @@ maint/host_checks/logs/*
 after
 before
 .specstory
+
+*.hipi
+*.bc
+*.s
+*.out
+*.resolution.txt
+*.hipfb
