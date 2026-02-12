@@ -209,3 +209,16 @@ v_mfma ...         ×N
 |------|------|
 | `/root/learn-hip/HipKittens/kernels/gemm/bf16fp32/256_256_64_32_with16x32.cpp` | HipKittens 手写 GEMM kernel（256×256 block, K_STEP=64, 16x32 swizzle）。展示了 readfirstlane hoisting、`make_srsrc` 构造 buffer resource descriptor、`s_setprio`/`s_sched_barrier` 调度控制等优化技巧 |
 | `/root/learn-hip/HipKittens/kernels/gemm/bf16fp32/256_256_64_32_with16x32-hip-amdgcn-amd-amdhsa-gfx950.spure.s` | 上述 HipKittens kernel 的 gfx950 汇编。关键对比点：热循环中 `buffer_load_dwordx4 ... lds` 只用 `s_mov_b32 m0` + `s_addk_i32` 更新地址（无 `v_readfirstlane`），`ds_read_b128` 与 `v_mfma` 有良好交错 |
+
+### 7.4 本地复现命令（本次会话实测）
+
+```bash
+# 目录：/A/tilelang
+/opt/venv/bin/python -c "import tilelang; print(tilelang.__version__)"
+bash build.sh
+```
+
+```bash
+# 目录：/A/tilelang/examples/gemm
+rm -rf ~/.tilelang/cache/ && /opt/venv/bin/python example_gemm.py
+```
