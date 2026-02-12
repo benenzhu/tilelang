@@ -331,6 +331,53 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
+    def ldmatrix_a_single(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, row_idx, rk=0):
+        """Load a single warp_row of A from shared memory into the local buffer.
+
+        Unlike ``ldmatrix_a`` which loops over all ``warp_rows``, this method
+        loads only the row specified by ``row_idx``.  Data is written at the
+        row's natural offset (``row_idx * k_pack * local_size_a``) within
+        ``A_local_buf``, so the buffer can hold all rows simultaneously.
+        """
+        warp_row_tiles = self.warp_row_tiles
+        chunk = self.chunk
+        micro_size_x = self.micro_size_x
+        micro_size_k = self.micro_size_k
+        local_size_a = self.local_size_a
+        k_pack = self.k_pack
+        is_transposed = self.a_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+
+        # legalize shared buffer to region
+        A_region = self._legalize_to_buffer_region(A_shared_buf)
+        A_buf = A_region.buffer
+        A_base0 = A_region.region[-2].min
+        A_base1 = A_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_a_single(
+            A_local_buf,
+            A_shared_buf,
+            ki,
+            row_idx,
+            thread_binding,
+            rk=0,
+        ):
+            tx, _, warp_m = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for local_id in T.vectorized(k_pack * local_size_a):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + row_idx * micro_size_x)
+                    A_local_buf[row_idx * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+            else:
+                for local_id in T.vectorized(k_pack * local_size_a):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (warp_m * warp_row_tiles + row_idx * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
+                    A_local_buf[row_idx * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+
+        return _warp_ldmatrix_a_single(A_local_buf, A_shared_buf, ki, row_idx, thread_binding, rk)
+
     def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, rk=0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
@@ -380,6 +427,54 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
+    def ldmatrix_b_single(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, col_idx, rk=0):
+        """Load a single warp_col of B from shared memory into the local buffer.
+
+        Unlike ``ldmatrix_b`` which loops over all ``warp_cols``, this method
+        loads only the column specified by ``col_idx``.  Data is always written
+        at offset 0 within ``B_local_buf`` (sized for one column), creating a
+        loop-carried dependency that prevents the simplifier from fissioning
+        the surrounding per-col loop.
+        """
+        warp_col_tiles = self.warp_col_tiles
+        chunk = self.chunk
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        local_size_b = self.local_size_b
+        k_pack = self.k_pack
+        is_transposed = self.b_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+
+        # legalize shared buffer to region
+        B_region = self._legalize_to_buffer_region(B_shared_buf)
+        B_buf = B_region.buffer
+        B_base0 = B_region.region[-2].min
+        B_base1 = B_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_b_single(
+            B_local_buf,
+            B_shared_buf,
+            ki,
+            col_idx,
+            thread_binding,
+            rk=0,
+        ):
+            tx, warp_n, _ = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for local_id in T.vectorized(k_pack * local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (warp_n * warp_col_tiles + col_idx * micro_size_y, rk * chunk + ki * (k_pack * micro_size_k))
+                    B_local_buf[local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+            else:
+                for local_id in T.vectorized(k_pack * local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_n * warp_col_tiles + col_idx * micro_size_y)
+                    B_local_buf[local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+
+        return _warp_ldmatrix_b_single(B_local_buf, B_shared_buf, ki, col_idx, thread_binding, rk)
+
     def mfma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
@@ -418,6 +513,138 @@ class MatrixCoreIntrinEmitter:
                 )
 
         return _warp_mfma(A_local_buf, B_local_buf, C_local_buf)
+
+    def mfma_slice(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0, row_idx: PrimExpr | int = 0):
+        """Compute MFMAs for a single warp_row.
+
+        Like ``mfma`` but only iterates over ``k_pack`` and ``warp_cols``
+        (no ``warp_rows`` loop).  ``row_idx`` selects which row of A to
+        read and which row of ``C_local_buf`` to accumulate into.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+
+        a_is_fragment = is_fragment(A_local_buf)
+        b_is_fragment = is_fragment(B_local_buf)
+        a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+        b_local_stride: PrimExpr = k_inner * warp_cols * k_pack * local_size_b if b_is_fragment else 0
+
+        @T.macro
+        def _warp_mfma_slice(A_local_buf, B_local_buf, C_local_buf, row_idx):
+            for kp, j in T.grid(k_pack, warp_cols):
+                T.tvm_mfma(
+                    mfma_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                    A_local_buf.data,
+                    (a_local_stride + (row_idx * k_pack + kp) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    (row_idx * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_slice(A_local_buf, B_local_buf, C_local_buf, row_idx)
+
+    def mfma_col_slice(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0, col_idx: PrimExpr | int = 0):
+        """Compute MFMAs for a single warp_col (all rows × one col).
+
+        Like ``mfma`` but only iterates over ``k_pack`` and ``warp_rows``
+        (no ``warp_cols`` loop).  ``col_idx`` selects which column of
+        ``C_local_buf`` to accumulate into.  ``B_local_buf`` is expected
+        to hold exactly one column (written by ``ldmatrix_b_single`` at
+        offset 0), so the B index uses ``kp`` only.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+
+        a_is_fragment = is_fragment(A_local_buf)
+        a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+
+        @T.macro
+        def _warp_mfma_col_slice(A_local_buf, B_local_buf, C_local_buf, col_idx):
+            for kp, i in T.grid(k_pack, warp_rows):
+                T.tvm_mfma(
+                    mfma_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    kp,
+                    A_local_buf.data,
+                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    (i * warp_cols * local_size_out + col_idx * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_col_slice(A_local_buf, B_local_buf, C_local_buf, col_idx)
+
+    def mfma_cell(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0, row_idx: PrimExpr | int = 0, col_idx: PrimExpr | int = 0):
+        """Compute k_pack MFMAs for a single (row, col) cell.
+
+        ``B_local_buf`` is expected to hold exactly one column (written by
+        ``ldmatrix_b_single`` at offset 0), so the B index uses ``kp`` only.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+
+        a_is_fragment = is_fragment(A_local_buf)
+        a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+
+        @T.macro
+        def _warp_mfma_cell(A_local_buf, B_local_buf, C_local_buf, row_idx, col_idx):
+            for kp in T.serial(k_pack):
+                T.tvm_mfma(
+                    mfma_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    kp,
+                    A_local_buf.data,
+                    (a_local_stride + (row_idx * k_pack + kp) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    (row_idx * warp_cols * local_size_out + col_idx * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_cell(A_local_buf, B_local_buf, C_local_buf, row_idx, col_idx)
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps

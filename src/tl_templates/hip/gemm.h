@@ -347,3 +347,31 @@ TL_DEVICE void gemm_rs(A_type *pA, B_type *pB, C_type *accum) {
 }
 
 } // namespace tl
+
+// ── Scheduling helpers for fine-grained S2R / MFMA interleaving ─────────────
+// These live in the global namespace so TIR call_extern can reference them
+// directly without a namespace prefix.
+//
+// tl_setprio_hi  – asm volatile "s_setprio 1" with VGPR read-write deps
+// tl_setprio_lo  – asm volatile "s_setprio 0" with VGPR read-only deps
+//
+// The "+v" / "v" constraints prevent LLVM from reordering or eliminating
+// the priority hint across MFMA / ds_read boundaries.
+
+static __device__ __forceinline__ void
+tl_setprio_hi(float *C, int off1, int off2) {
+  asm volatile("s_setprio 1"
+               : "+v"(*((float32x4 *)C + off1)),
+                 "+v"(*((float32x4 *)C + off2))
+               :
+               : "memory");
+}
+
+static __device__ __forceinline__ void
+tl_setprio_lo(float *C, int off1, int off2) {
+  asm volatile("s_setprio 0"
+               :
+               : "v"(*((float32x4 *)C + off1)),
+                 "v"(*((float32x4 *)C + off2))
+               : "memory");
+}

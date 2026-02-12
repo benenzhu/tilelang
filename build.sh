@@ -12,6 +12,7 @@
 #   "Neither GTest::GTest nor GTest::gtest targets defined IMPORTED_LOCATION"
 # You need to remove libgtest-dev:
 #   sudo apt-get remove -y libgtest-dev
+declare -x PATH="/opt/venv/bin:/root/.cursor-server/bin/linux-x64/3578107fdf149b00059ddad37048220e41681000/bin/remote-cli:/root/.cursor-server/bin/linux-x64/3578107fdf149b00059ddad37048220e41681000/bin/remote-cli:/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.cursor-server/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts"
 sudo apt-get remove -y libgtest-dev
 set -e
 

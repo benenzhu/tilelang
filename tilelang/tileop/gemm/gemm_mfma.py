@@ -131,35 +131,136 @@ class GemmMFMA(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         if self.is_gemm_ss():
+            # Pre-compute C_local float32x4 offsets for setprio register deps
+            # offset = row_idx * warp_cols (in float32x4 units)
+            _c_off_row0 = 0 * warp_cols
+            _c_off_row1 = 1 * warp_cols
+            _c_off_row2 = 2 * warp_cols
+            _c_off_row3 = 3 * warp_cols
 
             @T.prim_func
             def _gemm_ssr() -> None:
                 """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Matrix Core mfma ops,
-                accumulating into C_local.
+                Fully-unrolled 8-round S2R-interleaved GEMM (gemm_ss)
+                with fine-grained scheduling barriers and priority hints.
+
+                Schedule (per ki iteration):
+                  Preamble  – 6 ds_read before first MFMA:
+                    load A rows 0-1 (4), load B col 0 (2)
+                  Round 0a  – MFMA rows 0-1 × col 0  (4 mfma)
+                    load A rows 2-3 (4, hidden behind mfma)
+                  Round 0b  – MFMA rows 2-3 × col 0  (4 mfma)
+                  Rounds 1-7 – per col: load B col (2) + MFMA all rows (8)
+
+                Scheduling annotations:
+                  sched_barrier(0)  between every load/MFMA region boundary
+                  asm volatile s_setprio with VGPR deps for rounds 0a/0b
+                  __builtin_amdgcn_s_setprio for round 1
+                  s_barrier() between round 0a→0b, 0b→1, 1→2
                 """
                 A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
-                B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
+                B_local = T.alloc_local((local_size_b * self.k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
                 for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
-                    # Load A into fragment
-                    mfma_emitter.ldmatrix_a(
-                        A_local,
-                        A_region,
-                        ki,
-                    )
+                    # ── sched_barrier: start of iteration ──
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
 
-                    # Load B into fragment
-                    mfma_emitter.ldmatrix_b(
-                        B_local,
-                        B_region,
-                        ki,
-                    )
+                    # ── Preamble: 6 ds_read before first MFMA ──
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(0))
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(1))
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(0))
 
-                    # Perform Matrix Multiplication
-                    mfma_emitter.mfma(A_local, B_local, C_buf, ki)
+                    # ── sched_barrier: end of preamble loads ──
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── s_setprio 1 with VGPR deps on C rows 0,1 ──
+                    tir.call_extern("int32", "tl_setprio_hi", C_buf.data,
+                                    tir.IntImm("int32", _c_off_row0),
+                                    tir.IntImm("int32", _c_off_row1))
+
+                    # ── Round 0a: MFMA rows 0-1 × col 0 (4 mfma) ──
+                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(0), T.int32(0))
+                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(1), T.int32(0))
+
+                    # ── s_setprio 0 with VGPR deps on C rows 0,1 ──
+                    tir.call_extern("int32", "tl_setprio_lo", C_buf.data,
+                                    tir.IntImm("int32", _c_off_row0),
+                                    tir.IntImm("int32", _c_off_row1))
+
+                    # ── s_barrier + sched_barrier: transition to A rows 2-3 loads ──
+                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── Load A rows 2-3 with sched_barrier between them ──
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(2))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(3))
+
+                    # ── sched_barrier: end of A rows 2-3 loads ──
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── s_setprio 1 with VGPR deps on C rows 2,3 ──
+                    tir.call_extern("int32", "tl_setprio_hi", C_buf.data,
+                                    tir.IntImm("int32", _c_off_row2),
+                                    tir.IntImm("int32", _c_off_row3))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── Round 0b: MFMA rows 2-3 × col 0 (4 mfma) ──
+                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(2), T.int32(0))
+                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(3), T.int32(0))
+
+                    # ── sched_barrier + s_setprio 0 ──
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    tir.call_extern("int32", "tl_setprio_lo", C_buf.data,
+                                    tir.IntImm("int32", _c_off_row2),
+                                    tir.IntImm("int32", _c_off_row3))
+
+                    # ── s_barrier + sched_barrier: transition to round 1 ──
+                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── Round 1: B col 1 load + MFMA ──
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(1))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(1))
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── s_barrier + sched_barrier: transition to rounds 2-7 ──
+                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    # ── Rounds 2-7: B col load + sched_barrier + MFMA + sched_barrier ──
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(2))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(2))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(3))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(3))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(4))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(4))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(5))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(5))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(6))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(6))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+
+                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(7))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(7))
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
@@ -170,9 +271,12 @@ class GemmMFMA(GemmBase):
             @T.prim_func
             def _gemm_srr() -> None:
                 """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Matrix Core mfma ops,
-                accumulating into C_local.
+                The inner macro that loads data from shared buffer A_shared
+                into local fragments, then issues Matrix Core mfma ops with
+                B already in registers, accumulating into C_local.
+
+                S2R loads for A are interleaved with MFMA compute on a
+                per-warp-row basis.
                 """
                 A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
 
@@ -180,15 +284,26 @@ class GemmMFMA(GemmBase):
                     T.clear(C_buf)
 
                 for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
-                    # Load A into fragment
-                    mfma_emitter.ldmatrix_a(
+                    # Load first row of A (ensures A_local declared
+                    # before B in codegen -- workaround for HIP
+                    # compiler VGPR allocation issue)
+                    mfma_emitter.ldmatrix_a_single(
                         A_local,
                         A_region,
                         ki,
+                        T.int32(0),
                     )
-
-                    # Perform Matrix Multiplication
-                    mfma_emitter.mfma(A_local, B_buf, C_buf, ki)
+                    # MFMA for row 0
+                    mfma_emitter.mfma_slice(A_local, B_buf, C_buf, ki, T.int32(0))
+                    # Interleave: remaining rows of A + MFMA
+                    for ri in T.serial(1, warp_rows):
+                        mfma_emitter.ldmatrix_a_single(
+                            A_local,
+                            A_region,
+                            ki,
+                            ri,
+                        )
+                        mfma_emitter.mfma_slice(A_local, B_buf, C_buf, ki, ri)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
@@ -201,9 +316,9 @@ class GemmMFMA(GemmBase):
             @T.prim_func
             def _gemm_rsr() -> None:
                 """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Matrix Core mfma ops,
-                accumulating into C_local.
+                The inner macro that loads data from shared buffer B_shared
+                into local fragments, with A already in registers, then issues
+                Matrix Core mfma ops, accumulating into C_local.
                 """
                 B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
                 if clear_accum:
