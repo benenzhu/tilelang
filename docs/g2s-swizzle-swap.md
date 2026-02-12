@@ -181,6 +181,13 @@ v_mfma ...         ×N
 
 ## 7. 相关文件参考
 
+> **⚠️ 重要：§7.2 和 §7.3 中的文件是核心参考，做任何优化工作前必须先阅读。**
+> - **§7.2** 是 TileLang 当前生成的 kernel 源码和汇编——这是我们要优化的对象。
+> - **§7.3** 是 HipKittens 手写的高性能 GEMM——这是我们的优化目标/参照基准。
+> - 对比两者的汇编差异是发现优化点的主要方法。
+
+### 7.1 TileLang 源码
+
 | 文件 | 作用 |
 |------|------|
 | `src/transform/inject_ptx_async_copy.cc` | 将 `BufferStore(shared, BufferLoad(global))` 转为 `ptx_cp_async` IR |
@@ -188,3 +195,17 @@ v_mfma ...         ×N
 | `src/layout/gemm_layouts.cc` | `makeMatrixCoreSwizzleLayout` — XOR swizzle layout 定义 |
 | `src/op/copy.cc` | Copy 操作的 lowering（`LowerNormalCopy`, `MakeSIMTLoop`） |
 | `src/transform/merge_shared_memory_allocations.cc` | 共享内存合并（HIP 上跳过） |
+
+### 7.2 TileLang 生成产物（GEMM 256×256×64, bf16, gfx950）🔴 必读
+
+| 文件 | 说明 |
+|------|------|
+| `/root/.tilelang/cache/<hash>/host_kernel.cu` | TileLang 编译缓存中的生成 HIP kernel 源码（含 `gemm_kernel`、`init`、`call` 函数）。路径中的 `<hash>` 由 kernel 定义决定，当前示例为 `34741f99f765d9a67bbf03cf6e8b538ca1f2f1ae914dc2efa23aba7af97f3d13`。可在 `/root/.tilelang/cache/` 下用 `find . -name host_kernel.cu` 查找 |
+| `examples/gemm/tmp_67acr4h-hip-amdgcn-amd-amdhsa-gfx950.spure.s` | TileLang GEMM 生成的 gfx950 汇编（纯指令，去掉了 directive），用于检查 `buffer_load_dwordx4 ... lds`、`vmcnt`、`ds_read_b128`、`v_mfma` 等指令的排布 |
+
+### 7.3 HipKittens 参考实现（GEMM 256×256×64, bf16, gfx950）🔴 必读
+
+| 文件 | 说明 |
+|------|------|
+| `/root/learn-hip/HipKittens/kernels/gemm/bf16fp32/256_256_64_32_with16x32.cpp` | HipKittens 手写 GEMM kernel（256×256 block, K_STEP=64, 16x32 swizzle）。展示了 readfirstlane hoisting、`make_srsrc` 构造 buffer resource descriptor、`s_setprio`/`s_sched_barrier` 调度控制等优化技巧 |
+| `/root/learn-hip/HipKittens/kernels/gemm/bf16fp32/256_256_64_32_with16x32-hip-amdgcn-amd-amdhsa-gfx950.spure.s` | 上述 HipKittens kernel 的 gfx950 汇编。关键对比点：热循环中 `buffer_load_dwordx4 ... lds` 只用 `s_mov_b32 m0` + `s_addk_i32` 更新地址（无 `v_readfirstlane`），`ds_read_b128` 与 `v_mfma` 有良好交错 |

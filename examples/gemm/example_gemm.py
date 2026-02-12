@@ -75,12 +75,23 @@ def main(transpose_b=False):
     
     if not transpose_b:
         b = torch.randn(K, N).cuda().bfloat16()
+        torch.cuda.synchronize()
+        print("execute kernel", flush=True)
         c = kernel(a, b)
+        torch.cuda.synchronize()
+        print("execute kernel done", flush=True)
         ref_c = a @ b
     else:
         # NT layout: B is (N, K) contiguous
         b_nt = torch.randn(N, K).cuda().bfloat16()
+        torch.cuda.synchronize()
+        print("execute kernel", flush=True)
         c = kernel(a, b_nt)
+        torch.cuda.synchronize()
+
+        import time
+        time.sleep(1)
+        print("execute kernel done", flush=True)
         ref_c = a @ b_nt.T
 
     # print("c:")
@@ -98,7 +109,6 @@ def main(transpose_b=False):
     # benchmark
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", rep=500)
-    # latency = profiler.do_bench()
 
     print(f"tilelang Latency: {latency}ms")
     print(f"tilelang flops: {2 * M * N * K / latency / 1e9} TFLOPS")

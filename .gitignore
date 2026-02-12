@@ -135,3 +135,7 @@ before
 *.resolution.txt
 *.hipfb
 examples/gemm/__tmp.py
+outdir/**
+outdir2/**
+examples/gemm/outdir/
+examples/gemm/outdir2/
