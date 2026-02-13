@@ -8,6 +8,7 @@
 #include <tvm/target/codegen.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/var.h>
 
 #include <string>
 #include <unordered_map>
@@ -16,7 +17,7 @@
 
 #include "target/source/codegen_c.h"
 
-namespace tvm {
+namespace tvm{
 namespace codegen {
 
 class CodeGenTileLangHIP final : public CodeGenC {
@@ -115,9 +116,34 @@ private:
   void ScanForG2SBuffers(const tir::Stmt &body);
 
   // Emit a decomposed G2S copy using a precomputed SRD.
+  // When hoisted G2S groups are available (precomputed before the pipeline
+  // loop), uses the precomputed voffset/soffset arrays.  Otherwise falls
+  // back to inline computation.
   void EmitDecomposedG2S(const std::string &dst, const std::string &src,
                          const std::string &size,
-                         const tir::VarNode *buf_var);
+                         const tir::VarNode *buf_var,
+                         const PrimExpr &src_access_ptr,
+                         const PrimExpr &dst_access_ptr);
+
+  // --- Pipeline loop tracking for G2S voffset hoisting ---
+  // The outermost Serial for-loop variable (the k-loop in pipelined GEMM).
+  tir::Var pipeline_loop_var_;
+  bool in_pipeline_loop_{false};
+
+  // Precomputed G2S voffset/soffset groups, emitted before the pipeline loop.
+  // Each entry corresponds to one ptx_cp_async call site (in DFS visit order).
+  struct G2SHoistGroup {
+    std::string voff_name;      // precomputed voffset array/scalar name
+    std::string soff_name;      // precomputed soff_base array/scalar name
+    std::string k_stride_str;   // k coefficient in bytes, as C expression
+    tir::Var unroll_var;        // enclosing unrolled loop var (undef if none)
+    int64_t unroll_extent;      // 0 if not in unrolled loop
+  };
+  std::vector<G2SHoistGroup> g2s_hoist_groups_;
+  int g2s_hoist_emit_idx_{0};
+
+  // Scan pipeline loop body and emit precomputed voffset/soffset arrays.
+  void EmitG2SHoistPrecomputation(const tir::ForNode *pipeline_loop);
 };
 
 } // namespace codegen

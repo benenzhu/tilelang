@@ -4,6 +4,7 @@
 
 #include "codegen_hip.h"
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/pattern.h>
 #include <tvm/ffi/function.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/index_map.h>
@@ -51,6 +52,66 @@ class G2SBufferScanner : public tir::StmtExprVisitor {
 
  private:
   std::unordered_set<const tir::VarNode *> seen_;
+};
+
+// ---------------------------------------------------------------------------
+// G2SHoistCollector: Pre-scan the pipeline loop body to collect G2S ops
+// along with their enclosing unrolled loop context.  This information is
+// used to emit precomputed voffset/soffset arrays *before* the k-loop,
+// eliminating all swizzle bit manipulation from the hot loop.
+// ---------------------------------------------------------------------------
+class G2SHoistCollector : public tir::StmtExprVisitor {
+ public:
+  struct Entry {
+    const tir::VarNode *buf_var;
+    PrimExpr src_expr;       // args[1] of ptx_cp_async
+    PrimExpr dst_expr;       // args[0] of ptx_cp_async
+    tir::Var unroll_var;     // enclosing unrolled loop var (undef if none)
+    int64_t unroll_extent;   // 0 if not in unrolled loop
+  };
+  std::vector<Entry> entries;
+
+  // Only collect ops for buffers that have SRD entries.
+  const std::unordered_map<const tir::VarNode *, std::string> *srd_map =
+      nullptr;
+
+ private:
+  tir::Var cur_unroll_var_;
+  int64_t cur_unroll_ext_{0};
+
+  void VisitStmt_(const tir::ForNode *op) final {
+    tir::Var saved_var = cur_unroll_var_;
+    int64_t saved_ext = cur_unroll_ext_;
+    if (op->kind == tir::ForKind::kUnrolled) {
+      if (auto *imm = op->extent.as<IntImmNode>()) {
+        cur_unroll_var_ = op->loop_var;
+        cur_unroll_ext_ = imm->value;
+      }
+    }
+    tir::StmtExprVisitor::VisitStmt_(op);
+    cur_unroll_var_ = saved_var;
+    cur_unroll_ext_ = saved_ext;
+  }
+
+  void VisitExpr_(const tir::CallNode *op) final {
+    if (op->op.same_as(tir::builtin::ptx_cp_async()) ||
+        op->op.same_as(tl::ptx_cp_async())) {
+      if (op->args.size() == 3) {
+        const tir::VarNode *bv =
+            CodeGenTileLangHIP::ExtractGlobalBufVar(op->args[1]);
+        if (bv && srd_map && srd_map->count(bv)) {
+          Entry e;
+          e.buf_var = bv;
+          e.src_expr = op->args[1];
+          e.dst_expr = op->args[0];
+          e.unroll_var = cur_unroll_var_;
+          e.unroll_extent = cur_unroll_ext_;
+          entries.push_back(e);
+        }
+      }
+    }
+    tir::StmtExprVisitor::VisitExpr_(op);
+  }
 };
 
 static std::string GetFP8Type(DataType type) {
@@ -189,6 +250,23 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
     PrintIndent();
     stream << "#pragma unroll\n";
   }
+  // Detect the pipeline k-loop BEFORE printing the for-header so we can
+  // emit precomputed voffset/soffset arrays before the loop starts.
+  // The loop variable must be allocated first so PrintExpr works inside
+  // EmitG2SHoistPrecomputation (it doesn't reference the loop var, but
+  // AllocVarID must happen before BeginScope).
+  bool is_pipeline_loop = false;
+  if (op->kind == tir::ForKind::kSerial && !in_pipeline_loop_) {
+    if (auto *ext = op->extent.as<IntImmNode>()) {
+      if (ext->value > 1) {
+        is_pipeline_loop = true;
+        pipeline_loop_var_ = op->loop_var;
+        in_pipeline_loop_ = true;
+        // Emit precomputed arrays before the for-loop header.
+        this->EmitG2SHoistPrecomputation(op);
+      }
+    }
+  }
   std::string extent =
       PrintExpr(arith::Analyzer().Simplify(op->extent + op->min));
   PrintIndent();
@@ -213,6 +291,11 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
   this->EndScope(for_scope);
   if (track_trip) {
     loop_trip_counts_.pop_back();
+  }
+  if (is_pipeline_loop) {
+    in_pipeline_loop_ = false;
+    g2s_hoist_groups_.clear();
+    g2s_hoist_emit_idx_ = 0;
   }
   PrintIndent();
   stream << "}\n";
@@ -836,7 +919,10 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (op->args.size() == 3 && src_buf_var &&
         g2s_srd_map_.count(src_buf_var)) {
       // Decomposed version using precomputed SRD.
-      this->EmitDecomposedG2S(dst, src, size, src_buf_var);
+      // Pass raw PrimExpr so EmitDecomposedG2S can decompose k-dependent
+      // vs k-independent address components via DetectLinearEquation.
+      this->EmitDecomposedG2S(dst, src, size, src_buf_var,
+                              op->args[1], op->args[0]);
     } else if (op->args.size() == 3) {
       // Non-predicated fallback (no SRD available).
       this->PrintIndent();
@@ -1541,18 +1627,202 @@ void CodeGenTileLangHIP::ScanForG2SBuffers(const tir::Stmt &body) {
 }
 
 // ---------------------------------------------------------------------------
-// EmitDecomposedG2S: Emit a decomposed G2S copy using a precomputed SRD.
-// Instead of recreating the buffer resource descriptor per load (4
-// readfirstlane), this reuses the SRD hoisted to function entry and
-// computes soffset/voffset from the printed pointer expressions.
+// EmitG2SHoistPrecomputation: Scan the pipeline loop body for G2S ops,
+// decompose their addresses, and emit precomputed voffset/soffset arrays
+// *before* the k-loop.  This eliminates all swizzle bit manipulation
+// (readfirstlane, XOR/FloorDiv/FloorMod of threadIdx) from the hot loop.
+// ---------------------------------------------------------------------------
+void CodeGenTileLangHIP::EmitG2SHoistPrecomputation(
+    const tir::ForNode *pipeline_loop) {
+  G2SHoistCollector collector;
+  collector.srd_map = &g2s_srd_map_;
+  collector(pipeline_loop->body);
+
+  g2s_hoist_groups_.clear();
+  g2s_hoist_emit_idx_ = 0;
+
+  for (size_t gi = 0; gi < collector.entries.size(); gi++) {
+    auto &entry = collector.entries[gi];
+
+    // Extract source offset and decompose w.r.t. pipeline loop var.
+    PrimExpr src_offset;
+    const tir::BufferNode *src_buffer = nullptr;
+    if (auto *call = entry.src_expr.as<tir::CallNode>()) {
+      if (call->op.same_as(tir::builtin::address_of())) {
+        if (auto *load = call->args[0].as<tir::BufferLoadNode>()) {
+          ICHECK_EQ(load->indices.size(), 1);
+          src_offset = load->indices[0];
+          src_buffer = load->buffer.get();
+        }
+      } else if (call->op.same_as(tir::builtin::tvm_access_ptr())) {
+        src_offset = call->args[2];
+      }
+    }
+    if (!src_offset.defined()) {
+      // Can't decompose — push empty group so indexing stays aligned.
+      g2s_hoist_groups_.push_back({"", "", "", tir::Var(), 0});
+      continue;
+    }
+
+    ffi::Array<tir::Var> vars = {pipeline_loop_var_};
+    auto linear = arith::DetectLinearEquation(src_offset, vars);
+    if (linear.size() != 2) {
+      g2s_hoist_groups_.push_back({"", "", "", tir::Var(), 0});
+      continue;
+    }
+
+    PrimExpr k_coeff = linear[0];
+    int elem_bytes = src_buffer ? src_buffer->dtype.bytes() : 2;
+    arith::Analyzer analyzer;
+    PrimExpr k_stride_bytes = analyzer.Simplify(
+        k_coeff * IntImm(k_coeff->dtype, elem_bytes));
+
+    std::string suffix = std::to_string(gi);
+    std::string voff_name = "__g2s_voff_" + suffix;
+    std::string soff_name = "__g2s_soff_" + suffix;
+    std::string k_stride_str = PrintExpr(k_stride_bytes);
+    std::string buf_name = GetVarID(entry.buf_var);
+
+    G2SHoistGroup group;
+    group.voff_name = voff_name;
+    group.soff_name = soff_name;
+    group.k_stride_str = k_stride_str;
+    group.unroll_var = entry.unroll_var;
+    group.unroll_extent = entry.unroll_extent;
+    g2s_hoist_groups_.push_back(group);
+
+    // Emit precomputed arrays/scalars.
+    if (entry.unroll_extent > 0) {
+      // Array form: one voffset/soffset per unrolled iteration.
+      this->PrintIndent();
+      this->stream << "uint32_t " << voff_name << "["
+                   << entry.unroll_extent << "];\n";
+      this->PrintIndent();
+      this->stream << "uint32_t " << soff_name << "["
+                   << entry.unroll_extent << "];\n";
+      // Manually unroll: substitute k=0 and unroll_var=constant for each i.
+      for (int64_t ui = 0; ui < entry.unroll_extent; ui++) {
+        tir::Var plv = pipeline_loop_var_;
+        tir::Var ulv = entry.unroll_var;
+        auto subst_fn = [&plv, &ulv, ui](
+            const tir::Var &var) -> ffi::Optional<PrimExpr> {
+          if (var.same_as(plv))
+            return IntImm(var->dtype, 0);
+          if (var.same_as(ulv))
+            return IntImm(var->dtype, static_cast<int64_t>(ui));
+          return ffi::Optional<PrimExpr>();
+        };
+        PrimExpr src_subst = tir::Substitute(entry.src_expr, subst_fn);
+        std::string src_str = PrintExpr(src_subst);
+
+        this->PrintIndent();
+        this->stream << "{\n";
+        this->PrintIndent();
+        this->stream << "  uint32_t __g = static_cast<uint32_t>("
+                     << "reinterpret_cast<uintptr_t>(" << src_str << "));\n";
+        this->PrintIndent();
+        this->stream << "  uint32_t __b = "
+                     << "__builtin_amdgcn_readfirstlane(__g);\n";
+        this->PrintIndent();
+        this->stream << "  " << voff_name << "[" << ui
+                     << "] = __g - __b;\n";
+        this->PrintIndent();
+        this->stream << "  " << soff_name << "[" << ui
+                     << "] = __b - static_cast<uint32_t>("
+                     << "reinterpret_cast<uintptr_t>(" << buf_name
+                     << "));\n";
+        this->PrintIndent();
+        this->stream << "}\n";
+      }
+    } else {
+      // Scalar form: single G2S op not inside an unrolled loop.
+      tir::Var plv = pipeline_loop_var_;
+      auto subst_fn = [&plv](
+          const tir::Var &var) -> ffi::Optional<PrimExpr> {
+        if (var.same_as(plv))
+          return IntImm(var->dtype, 0);
+        return ffi::Optional<PrimExpr>();
+      };
+      PrimExpr src_subst = tir::Substitute(entry.src_expr, subst_fn);
+      std::string src_str = PrintExpr(src_subst);
+
+      this->PrintIndent();
+      this->stream << "uint32_t " << voff_name << ", " << soff_name << ";\n";
+      this->PrintIndent();
+      this->stream << "{\n";
+      this->PrintIndent();
+      this->stream << "  uint32_t __g = static_cast<uint32_t>("
+                   << "reinterpret_cast<uintptr_t>(" << src_str << "));\n";
+      this->PrintIndent();
+      this->stream << "  uint32_t __b = "
+                   << "__builtin_amdgcn_readfirstlane(__g);\n";
+      this->PrintIndent();
+      this->stream << "  " << voff_name << " = __g - __b;\n";
+      this->PrintIndent();
+      this->stream << "  " << soff_name
+                   << " = __b - static_cast<uint32_t>("
+                   << "reinterpret_cast<uintptr_t>(" << buf_name
+                   << "));\n";
+      this->PrintIndent();
+      this->stream << "}\n";
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EmitDecomposedG2S: Emit a G2S copy using the precomputed SRD.
+// When hoisted groups are available, uses precomputed voffset/soffset.
+// Otherwise falls back to inline computation.
 // ---------------------------------------------------------------------------
 void CodeGenTileLangHIP::EmitDecomposedG2S(const std::string &dst,
                                             const std::string &src,
                                             const std::string &size,
-                                            const tir::VarNode *buf_var) {
+                                            const tir::VarNode *buf_var,
+                                            const PrimExpr &src_access_ptr,
+                                            const PrimExpr &dst_access_ptr) {
   std::string srd = g2s_srd_map_[buf_var];
   std::string buf_name = GetVarID(buf_var);
-  // Emit a block so local temporaries don't clash.
+
+  // Use precomputed hoisted groups when available.
+  if (in_pipeline_loop_ &&
+      g2s_hoist_emit_idx_ < static_cast<int>(g2s_hoist_groups_.size())) {
+    auto &group = g2s_hoist_groups_[g2s_hoist_emit_idx_];
+    g2s_hoist_emit_idx_++;
+
+    if (!group.voff_name.empty()) {
+      std::string k_var_name = GetVarID(pipeline_loop_var_.get());
+
+      // Build voffset/soffset references (array[i] or scalar).
+      std::string voff_ref, soff_ref;
+      if (group.unroll_extent > 0) {
+        std::string idx = GetVarID(group.unroll_var.get());
+        voff_ref = group.voff_name + "[" + idx + "]";
+        soff_ref = group.soff_name + "[" + idx + "]";
+      } else {
+        voff_ref = group.voff_name;
+        soff_ref = group.soff_name;
+      }
+
+      this->PrintIndent();
+      this->stream << "{\n";
+      this->PrintIndent();
+      this->stream << "  uint32_t __lds_m0 = __builtin_amdgcn_readfirstlane("
+                   << "static_cast<uint32_t>(reinterpret_cast<uintptr_t>("
+                   << dst << ")));\n";
+      this->PrintIndent();
+      this->stream << "  tl::cp_async_gs_v2<" << size << ">("
+                   << "__lds_m0, " << srd << ", "
+                   << voff_ref << ", "
+                   << soff_ref << " + " << k_var_name << " * "
+                   << group.k_stride_str << ");\n";
+      this->PrintIndent();
+      this->stream << "}\n";
+      return;
+    }
+    // Group exists but wasn't hoisted (decomposition failed) — fall through.
+  }
+
+  // Fallback: inline computation (outside pipeline loop or hoist failed).
   this->PrintIndent();
   this->stream << "{\n";
   this->PrintIndent();

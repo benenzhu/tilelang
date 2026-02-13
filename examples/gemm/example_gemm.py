@@ -1,6 +1,7 @@
 import tilelang
 import tilelang.language as T
 import os
+os.system("rm *.s")
 
 
 # @tilelang.jit(out_idx=[-1], debug_root_path="./debug_output", pass_configs={
