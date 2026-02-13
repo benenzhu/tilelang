@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+import os
 
 
 # @tilelang.jit(out_idx=[-1], debug_root_path="./debug_output", pass_configs={
@@ -52,7 +53,7 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_shared)
-                T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
+                T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True)
             
             T.copy(C_local, C[by * block_M, bx * block_N])
     
@@ -108,7 +109,8 @@ def main(transpose_b=False):
 
     # benchmark
     profiler = kernel.get_profiler()
-    latency = profiler.do_bench(backend="cupti", rep=500)
+    if not os.environ.get("ZZPERF", ""):
+        latency = profiler.do_bench(backend="cupti", rep=500)
 
     print(f"tilelang Latency: {latency}ms")
     print(f"tilelang flops: {2 * M * N * K / latency / 1e9} TFLOPS")

@@ -139,3 +139,5 @@ outdir/**
 outdir2/**
 examples/gemm/outdir/
 examples/gemm/outdir2/
+
+examples/gemm/a.tar.gz

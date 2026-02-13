@@ -378,6 +378,53 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_a_single(A_local_buf, A_shared_buf, ki, row_idx, thread_binding, rk)
 
+    def ldmatrix_a_halfkp(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, row_idx, kp_idx, rk=0):
+        """Load one kp-half of a single warp_row of A from shared memory.
+
+        Loads ``local_size_a`` elements (one ds_read_b128) corresponding to
+        the ``kp_idx``-th k-pack slice.  Data is written at offset
+        ``row_idx * k_pack * local_size_a + kp_idx * local_size_a`` within
+        ``A_local_buf``.
+        """
+        warp_row_tiles = self.warp_row_tiles
+        chunk = self.chunk
+        micro_size_x = self.micro_size_x
+        micro_size_k = self.micro_size_k
+        local_size_a = self.local_size_a
+        k_pack = self.k_pack
+        is_transposed = self.a_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+
+        A_region = self._legalize_to_buffer_region(A_shared_buf)
+        A_buf = A_region.buffer
+        A_base0 = A_region.region[-2].min
+        A_base1 = A_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_a_halfkp(
+            A_local_buf,
+            A_shared_buf,
+            ki,
+            row_idx,
+            kp_idx,
+            thread_binding,
+            rk=0,
+        ):
+            tx, _, warp_m = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for local_id in T.vectorized(local_size_a):
+                    row, col = T.meta_var(reverse_index_map(tx, kp_idx * local_size_a + local_id))
+                    l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + row_idx * micro_size_x)
+                    A_local_buf[row_idx * k_pack * local_size_a + kp_idx * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+            else:
+                for local_id in T.vectorized(local_size_a):
+                    row, col = T.meta_var(reverse_index_map(tx, kp_idx * local_size_a + local_id))
+                    l, r = (warp_m * warp_row_tiles + row_idx * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
+                    A_local_buf[row_idx * k_pack * local_size_a + kp_idx * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+
+        return _warp_ldmatrix_a_halfkp(A_local_buf, A_shared_buf, ki, row_idx, kp_idx, thread_binding, rk)
+
     def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, rk=0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
@@ -474,6 +521,102 @@ class MatrixCoreIntrinEmitter:
                     B_local_buf[local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 
         return _warp_ldmatrix_b_single(B_local_buf, B_shared_buf, ki, col_idx, thread_binding, rk)
+
+    def ldmatrix_b_halfkp(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, col_idx, kp_idx, slot_idx, rk=0):
+        """Load one kp-half of a single warp_col of B into a specific slot.
+
+        Loads ``local_size_b`` elements (one ds_read_b128) corresponding to
+        the ``kp_idx``-th k-pack slice of column ``col_idx``.  Data is written
+        at offset ``slot_idx * local_size_b`` within ``B_local_buf``, allowing
+        multiple half-columns to coexist in the expanded B_local buffer.
+        """
+        warp_col_tiles = self.warp_col_tiles
+        chunk = self.chunk
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        local_size_b = self.local_size_b
+        k_pack = self.k_pack
+        is_transposed = self.b_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+
+        B_region = self._legalize_to_buffer_region(B_shared_buf)
+        B_buf = B_region.buffer
+        B_base0 = B_region.region[-2].min
+        B_base1 = B_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_b_halfkp(
+            B_local_buf,
+            B_shared_buf,
+            ki,
+            col_idx,
+            kp_idx,
+            slot_idx,
+            thread_binding,
+            rk=0,
+        ):
+            tx, warp_n, _ = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for local_id in T.vectorized(local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, kp_idx * local_size_b + local_id))
+                    l, r = (warp_n * warp_col_tiles + col_idx * micro_size_y, rk * chunk + ki * (k_pack * micro_size_k))
+                    B_local_buf[slot_idx * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+            else:
+                for local_id in T.vectorized(local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, kp_idx * local_size_b + local_id))
+                    l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_n * warp_col_tiles + col_idx * micro_size_y)
+                    B_local_buf[slot_idx * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+
+        return _warp_ldmatrix_b_halfkp(B_local_buf, B_shared_buf, ki, col_idx, kp_idx, slot_idx, thread_binding, rk)
+
+    def ldmatrix_b_to_slot(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, col_idx, slot_idx, rk=0):
+        """Load a full warp_col of B into a specific slot of B_local.
+
+        Like ``ldmatrix_b_single`` but writes at offset
+        ``slot_idx * k_pack * local_size_b`` instead of offset 0, allowing
+        multiple columns to coexist in the expanded B_local buffer.
+        """
+        warp_col_tiles = self.warp_col_tiles
+        chunk = self.chunk
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        local_size_b = self.local_size_b
+        k_pack = self.k_pack
+        is_transposed = self.b_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+
+        B_region = self._legalize_to_buffer_region(B_shared_buf)
+        B_buf = B_region.buffer
+        B_base0 = B_region.region[-2].min
+        B_base1 = B_region.region[-1].min
+
+        col_stride = k_pack * local_size_b
+
+        @T.macro
+        def _warp_ldmatrix_b_to_slot(
+            B_local_buf,
+            B_shared_buf,
+            ki,
+            col_idx,
+            slot_idx,
+            thread_binding,
+            rk=0,
+        ):
+            tx, warp_n, _ = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for local_id in T.vectorized(k_pack * local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (warp_n * warp_col_tiles + col_idx * micro_size_y, rk * chunk + ki * (k_pack * micro_size_k))
+                    B_local_buf[slot_idx * col_stride + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+            else:
+                for local_id in T.vectorized(k_pack * local_size_b):
+                    row, col = T.meta_var(reverse_index_map(tx, local_id))
+                    l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_n * warp_col_tiles + col_idx * micro_size_y)
+                    B_local_buf[slot_idx * col_stride + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+
+        return _warp_ldmatrix_b_to_slot(B_local_buf, B_shared_buf, ki, col_idx, slot_idx, thread_binding, rk)
 
     def mfma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
         warp_rows = self.warp_rows
@@ -645,6 +788,98 @@ class MatrixCoreIntrinEmitter:
                 )
 
         return _warp_mfma_cell(A_local_buf, B_local_buf, C_local_buf, row_idx, col_idx)
+
+    def mfma_halfkp_block(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
+                           k_inner: PrimExpr | None = 0, row_start: PrimExpr | int = 0,
+                           col_offset: PrimExpr | int = 0, kp_idx: PrimExpr | int = 0):
+        """Compute 8 MFMAs: 2 rows x 4 cols x 1 kp.
+
+        ``B_local_buf`` holds 4 half-columns (each ``local_size_b`` elements)
+        at slots 0-3.  ``kp_idx`` selects which k-pack half to compute.
+        ``row_start`` is 0 or 2 (selects which pair of warp_rows).
+        ``col_offset`` is the base column index in ``C_local_buf``.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+
+        a_is_fragment = is_fragment(A_local_buf)
+        a_local_stride: PrimExpr = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+
+        @T.macro
+        def _warp_mfma_halfkp_block(A_local_buf, B_local_buf, C_local_buf, row_start, col_offset, kp_idx):
+            for slot, ri in T.grid(4, 2):
+                T.tvm_mfma(
+                    mfma_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    slot,
+                    A_local_buf.data,
+                    (a_local_stride + ((row_start + ri) * k_pack + kp_idx) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    ((row_start + ri) * warp_cols * local_size_out + (col_offset + slot) * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_halfkp_block(A_local_buf, B_local_buf, C_local_buf, row_start, col_offset, kp_idx)
+
+    def mfma_block(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
+                   k_inner: PrimExpr | None = 0, row_start: PrimExpr | int = 0,
+                   col_offset: PrimExpr | int = 0,
+                   num_rows: int = 2, num_b_cols: int = 4):
+        """Compute ``num_rows * num_b_cols * k_pack`` MFMAs in one batch.
+
+        ``B_local_buf`` holds ``num_b_cols`` columns packed contiguously,
+        each consisting of ``k_pack * local_size_b`` elements.
+
+        The MFMA iteration order is *col-major* (outer: B-slot, inner: A-row)
+        so the same B vector is reused for ``num_rows`` consecutive MFMAs.
+        """
+        warp_rows = self.warp_rows
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+        a_local_stride = 0
+
+        @T.macro
+        def _warp_mfma_block(A_local_buf, B_local_buf, C_local_buf, row_start, col_offset):
+            for slot, kp, ri in T.grid(num_b_cols, k_pack, num_rows):
+                T.tvm_mfma(
+                    mfma_suffix,
+                    "row",
+                    "row",
+                    compute_a_dtype,
+                    compute_b_dtype,
+                    compute_out_dtype,
+                    B_local_buf.data,
+                    (slot * k_pack + kp),
+                    A_local_buf.data,
+                    (a_local_stride + ((row_start + ri) * k_pack + kp) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    ((row_start + ri) * warp_cols * local_size_out + (col_offset + slot) * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_block(A_local_buf, B_local_buf, C_local_buf, row_start, col_offset)
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps

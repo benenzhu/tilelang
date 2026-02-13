@@ -5,11 +5,14 @@
 #include "codegen_hip.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
+#include <tvm/tir/builtin.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <cmath>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,37 @@
 
 namespace tvm {
 namespace codegen {
+
+// ---------------------------------------------------------------------------
+// G2SBufferScanner: Pre-scan TIR body to find global buffer Vars used in
+// ptx_cp_async (G2S) calls.  This enables hoisting the buffer resource
+// descriptor (SRD) creation to function entry, eliminating 4 readfirstlane
+// instructions per buffer_load_dwordx4 on AMD GPUs.
+// ---------------------------------------------------------------------------
+class G2SBufferScanner : public tir::StmtExprVisitor {
+ public:
+  // Collected unique global buffer data Vars (from the *source* side of G2S).
+  std::vector<const tir::VarNode *> buffers;
+
+  void VisitExpr_(const tir::CallNode *op) final {
+    if (op->op.same_as(tir::builtin::ptx_cp_async()) ||
+        op->op.same_as(tl::ptx_cp_async())) {
+      // args[1] = source access ptr (global memory).
+      if (op->args.size() >= 3) {
+        const tir::VarNode *buf_var =
+            CodeGenTileLangHIP::ExtractGlobalBufVar(op->args[1]);
+        if (buf_var && !seen_.count(buf_var)) {
+          seen_.insert(buf_var);
+          buffers.push_back(buf_var);
+        }
+      }
+    }
+    tir::StmtExprVisitor::VisitExpr_(op);
+  }
+
+ private:
+  std::unordered_set<const tir::VarNode *> seen_;
+};
 
 static std::string GetFP8Type(DataType type) {
   std::stringstream stream;
@@ -796,13 +830,21 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string dst = this->PrintExpr(op->args[0]);
     std::string src = this->PrintExpr(op->args[1]);
     std::string size = this->PrintExpr(op->args[2]);
-    this->PrintIndent();
-    if (op->args.size() == 3) {
-      // Non-predicated version
+
+    // Try decomposed G2S copy path (hoisted SRD, saves 4 readfirstlane/load).
+    const tir::VarNode *src_buf_var = ExtractGlobalBufVar(op->args[1]);
+    if (op->args.size() == 3 && src_buf_var &&
+        g2s_srd_map_.count(src_buf_var)) {
+      // Decomposed version using precomputed SRD.
+      this->EmitDecomposedG2S(dst, src, size, src_buf_var);
+    } else if (op->args.size() == 3) {
+      // Non-predicated fallback (no SRD available).
+      this->PrintIndent();
       this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
                    << ");\n";
     } else {
       // Predicated version
+      this->PrintIndent();
       std::string condition = this->PrintExpr(op->args[3]);
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
                    << ", " << src << ", " << condition << ");\n";
@@ -1462,11 +1504,86 @@ void CodeGenTileLangHIP::PrintVecElemLoadExpr(DataType t, int i,
   return;
 }
 
+// ---------------------------------------------------------------------------
+// ExtractGlobalBufVar: Given an access-ptr expression from a ptx_cp_async
+// call, extract the underlying buffer data Var.  Handles both the lowered
+// form (address_of(BufferLoad)) and the un-lowered form (tvm_access_ptr).
+// ---------------------------------------------------------------------------
+const tir::VarNode *
+CodeGenTileLangHIP::ExtractGlobalBufVar(const PrimExpr &expr) {
+  if (auto *call = expr.as<tir::CallNode>()) {
+    // Lowered form: address_of(BufferLoad(buf, [offset]))
+    if (call->op.same_as(tir::builtin::address_of())) {
+      if (auto *load = call->args[0].as<tir::BufferLoadNode>()) {
+        return load->buffer->data.get();
+      }
+    }
+    // Un-lowered form: tvm_access_ptr(dtype, buf_var, offset, extent, mask)
+    if (call->op.same_as(tir::builtin::tvm_access_ptr())) {
+      return call->args[1].as<tir::VarNode>();
+    }
+  }
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// ScanForG2SBuffers: Walk the TIR body and collect global buffer data Vars
+// that appear as sources in ptx_cp_async calls (G2S copies).
+// ---------------------------------------------------------------------------
+void CodeGenTileLangHIP::ScanForG2SBuffers(const tir::Stmt &body) {
+  G2SBufferScanner scanner;
+  scanner(body);
+  for (const tir::VarNode *buf_var : scanner.buffers) {
+    std::string buf_name = GetVarID(buf_var);
+    std::string srd_name = "__srd_" + buf_name;
+    g2s_srd_map_[buf_var] = srd_name;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EmitDecomposedG2S: Emit a decomposed G2S copy using a precomputed SRD.
+// Instead of recreating the buffer resource descriptor per load (4
+// readfirstlane), this reuses the SRD hoisted to function entry and
+// computes soffset/voffset from the printed pointer expressions.
+// ---------------------------------------------------------------------------
+void CodeGenTileLangHIP::EmitDecomposedG2S(const std::string &dst,
+                                            const std::string &src,
+                                            const std::string &size,
+                                            const tir::VarNode *buf_var) {
+  std::string srd = g2s_srd_map_[buf_var];
+  std::string buf_name = GetVarID(buf_var);
+  // Emit a block so local temporaries don't clash.
+  this->PrintIndent();
+  this->stream << "{\n";
+  this->PrintIndent();
+  this->stream << "  uint32_t __lds_m0 = __builtin_amdgcn_readfirstlane("
+               << "static_cast<uint32_t>(reinterpret_cast<uintptr_t>("
+               << dst << ")));\n";
+  this->PrintIndent();
+  this->stream << "  uint32_t __glo_lo = "
+               << "static_cast<uint32_t>(reinterpret_cast<uintptr_t>("
+               << src << "));\n";
+  this->PrintIndent();
+  this->stream << "  uint32_t __base_lo = "
+               << "__builtin_amdgcn_readfirstlane(__glo_lo);\n";
+  this->PrintIndent();
+  this->stream << "  tl::cp_async_gs_v2<" << size << ">("
+               << "__lds_m0, " << srd << ", "
+               << "__glo_lo - __base_lo, "
+               << "__base_lo - static_cast<uint32_t>("
+               << "reinterpret_cast<uintptr_t>(" << buf_name << ")));\n";
+  this->PrintIndent();
+  this->stream << "}\n";
+}
+
 void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   // clear previous generated state.
   this->InitFuncState(f);
   // reserve keywords
   ReserveKeywordsAsUnique();
+
+  // Reset per-function G2S SRD tracking.
+  g2s_srd_map_.clear();
 
   auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
   ICHECK(global_symbol.has_value())
@@ -1523,6 +1640,20 @@ void CodeGenTileLangHIP::AddFunction(const PrimFunc &f) {
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+
+  // --- Emit hoisted SRD declarations for G2S copy optimization ---
+  // Pre-scan the body to find global buffers used in ptx_cp_async calls,
+  // then emit one SRD creation per buffer at function entry.  This avoids
+  // recreating the 128-bit buffer resource descriptor (4 readfirstlane
+  // instructions) on every buffer_load_dwordx4.
+  this->ScanForG2SBuffers(f->body);
+  for (auto &[buf_var, srd_name] : g2s_srd_map_) {
+    std::string buf_name = GetVarID(buf_var);
+    this->PrintIndent();
+    this->stream << "auto " << srd_name
+                 << " = tl::cp_async_make_srd(" << buf_name << ");\n";
+  }
+
   this->PrintStmt(f->body);
   this->EndScope(func_scope);
   this->PrintIndent();

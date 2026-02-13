@@ -11,6 +11,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "target/source/codegen_c.h"
@@ -53,6 +54,11 @@ public:
 
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const PrimFunc &f);
+
+  // Extract the global buffer data Var from a tvm_access_ptr expression.
+  // Public because G2SBufferScanner (in codegen_hip.cc) needs access.
+  static const tir::VarNode *
+  ExtractGlobalBufVar(const PrimExpr &access_ptr_expr);
 
 protected:
   virtual std::string GetBufferRef(DataType t, const BufferNode *buffer,
@@ -99,6 +105,19 @@ private:
   int async_ops_since_commit_{0};
   int ops_per_commit_group_{0};
   std::vector<int> loop_trip_counts_;
+
+  // --- Optimized G2S copy with precomputed SRD (AMD) ---
+  // Maps global buffer VarNode* to the name of the hoisted SRD variable.
+  // Populated during AddFunction's pre-scan, used when emitting ptx_cp_async.
+  std::unordered_map<const tir::VarNode *, std::string> g2s_srd_map_;
+
+  // Pre-scan TIR body to collect global buffer Vars used in ptx_cp_async calls.
+  void ScanForG2SBuffers(const tir::Stmt &body);
+
+  // Emit a decomposed G2S copy using a precomputed SRD.
+  void EmitDecomposedG2S(const std::string &dst, const std::string &src,
+                         const std::string &size,
+                         const tir::VarNode *buf_var);
 };
 
 } // namespace codegen

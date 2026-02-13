@@ -131,136 +131,76 @@ class GemmMFMA(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         if self.is_gemm_ss():
-            # Pre-compute C_local float32x4 offsets for setprio register deps
-            # offset = row_idx * warp_cols (in float32x4 units)
-            _c_off_row0 = 0 * warp_cols
-            _c_off_row1 = 1 * warp_cols
-            _c_off_row2 = 2 * warp_cols
-            _c_off_row3 = 3 * warp_cols
 
             @T.prim_func
             def _gemm_ssr() -> None:
                 """
-                Fully-unrolled 8-round S2R-interleaved GEMM (gemm_ss)
-                with fine-grained scheduling barriers and priority hints.
+                4-stage S2R GEMM schedule (gemm_ss), k_pack=1.
 
-                Schedule (per ki iteration):
-                  Preamble  – 6 ds_read before first MFMA:
-                    load A rows 0-1 (4), load B col 0 (2)
-                  Round 0a  – MFMA rows 0-1 × col 0  (4 mfma)
-                    load A rows 2-3 (4, hidden behind mfma)
-                  Round 0b  – MFMA rows 2-3 × col 0  (4 mfma)
-                  Rounds 1-7 – per col: load B col (2) + MFMA all rows (8)
+                Per ki iteration (repeated 2x for block_K=64, micro_k=32):
+                  Stage 0: load A row{0,1} + B col{0..3} (6 ds_read) -> 8 MFMA
+                  Stage 1: load A row{2,3}  (2 ds_read, reuse B) -> 8 MFMA
+                  Stage 2: load B col{4,5}  (2 ds_read, reuse A) -> 8 MFMA
+                  Stage 3: load B col{6,7}  (2 ds_read, reuse A) -> 8 MFMA
 
-                Scheduling annotations:
-                  sched_barrier(0)  between every load/MFMA region boundary
-                  asm volatile s_setprio with VGPR deps for rounds 0a/0b
-                  __builtin_amdgcn_s_setprio for round 1
-                  s_barrier() between round 0a→0b, 0b→1, 1→2
+                Totals per ki: 12 ds_read, 32 MFMA
+                Totals overall: 24 ds_read, 64 MFMA
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
-                B_local = T.alloc_local((local_size_b * self.k_pack), in_dtype)
+                k_pack = self.k_pack if self.k_pack is not None else 1
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
+                # B_local expanded to 4 cols for stages 0-1
+                B_local = T.alloc_local((4 * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
-                    # ── sched_barrier: start of iteration ──
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
 
-                    # ── Preamble: 6 ds_read before first MFMA ──
+                    # ═══════ Stage 0: A row{0,1} + B col{0,1,2,3} -> 8 MFMA ═══════
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
                     mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(0))
                     mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(1))
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(0))
-
-                    # ── sched_barrier: end of preamble loads ──
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    # ── s_setprio 1 with VGPR deps on C rows 0,1 ──
-                    tir.call_extern("int32", "tl_setprio_hi", C_buf.data,
-                                    tir.IntImm("int32", _c_off_row0),
-                                    tir.IntImm("int32", _c_off_row1))
-
-                    # ── Round 0a: MFMA rows 0-1 × col 0 (4 mfma) ──
-                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(0), T.int32(0))
-                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(1), T.int32(0))
-
-                    # ── s_setprio 0 with VGPR deps on C rows 0,1 ──
-                    tir.call_extern("int32", "tl_setprio_lo", C_buf.data,
-                                    tir.IntImm("int32", _c_off_row0),
-                                    tir.IntImm("int32", _c_off_row1))
-
-                    # ── s_barrier + sched_barrier: transition to A rows 2-3 loads ──
-                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    # ── Load A rows 2-3 with sched_barrier between them ──
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(2))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(3))
-
-                    # ── sched_barrier: end of A rows 2-3 loads ──
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    # ── s_setprio 1 with VGPR deps on C rows 2,3 ──
-                    tir.call_extern("int32", "tl_setprio_hi", C_buf.data,
-                                    tir.IntImm("int32", _c_off_row2),
-                                    tir.IntImm("int32", _c_off_row3))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    # ── Round 0b: MFMA rows 2-3 × col 0 (4 mfma) ──
-                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(2), T.int32(0))
-                    mfma_emitter.mfma_cell(A_local, B_local, C_buf, ki, T.int32(3), T.int32(0))
-
-                    # ── sched_barrier + s_setprio 0 ──
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "tl_setprio_lo", C_buf.data,
-                                    tir.IntImm("int32", _c_off_row2),
-                                    tir.IntImm("int32", _c_off_row3))
-
-                    # ── s_barrier + sched_barrier: transition to round 1 ──
-                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    # ── Round 1: B col 1 load + MFMA ──
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(1))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(0), T.int32(0))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(1), T.int32(1))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(2), T.int32(2))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(3), T.int32(3))
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
                     tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(1))
+                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
+                                            row_start=T.int32(0), col_offset=T.int32(0),
+                                            num_rows=2, num_b_cols=4)
                     tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
 
-                    # ── s_barrier + sched_barrier: transition to rounds 2-7 ──
-                    tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
+                    # ═══════ Stage 1: A row{2,3}, reuse B -> 8 MFMA ═══════
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(2))
+                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(3))
+                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
+                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
+                                            row_start=T.int32(2), col_offset=T.int32(0),
+                                            num_rows=2, num_b_cols=4)
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
 
-                    # ── Rounds 2-7: B col load + sched_barrier + MFMA + sched_barrier ──
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(2))
+                    # ═══════ Stage 2: B col{4,5}, A fully loaded -> 8 MFMA ═══════
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(2))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(4), T.int32(0))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(5), T.int32(1))
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
+                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
+                                            row_start=T.int32(0), col_offset=T.int32(4),
+                                            num_rows=4, num_b_cols=2)
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
 
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(3))
+                    # ═══════ Stage 3: B col{6,7} -> 8 MFMA ═══════
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(3))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(6), T.int32(0))
+                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(7), T.int32(1))
                     tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(4))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(4))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(5))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(5))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(6))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(6))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-
-                    mfma_emitter.ldmatrix_b_single(B_local, B_region, ki, T.int32(7))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.mfma_col_slice(A_local, B_local, C_buf, ki, T.int32(7))
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
+                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
+                                            row_start=T.int32(0), col_offset=T.int32(6),
+                                            num_rows=4, num_b_cols=2)
+                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
