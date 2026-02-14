@@ -203,15 +203,20 @@ The codegen then:
 3. Stores into precomputed arrays before the loop
 4. Inside the loop, each G2S load is: `cp_async_gs_v2(lds_m0, srd, voff[i], soff[i] + k * stride_bytes)`
 
+### Investigated but not viable
+
+1. **LDS m0 precomputation** (attempted, reverted): Tried precomputing `readfirstlane(&A_shared[...])` for both double-buffer slots into `uint32_t __g2s_lds_N[2][4]` arrays before the k-loop, then using `__g2s_lds_N[k&1][i_3]` inside the loop.
+   - **Problem 1**: `s_mov_b32 m0` requires an SGPR input, but array values live in VGPRs. Wrapping with another `readfirstlane` fixes assembly.
+   - **Problem 2**: Even with the readfirstlane wrapper, results were incorrect (23.6% element mismatches). The compiler allocated 163840 bytes LDS instead of 131072 — the precomputation referencing `A_shared`/`B_shared` before the k-loop may have affected the compiler's shared memory layout or alias analysis.
+   - **Conclusion**: The LDS address computation is lightweight (3-4 SALU: LDS base constant + double-buffer select + unrolled offset), so the potential gain is marginal. Left as inline `readfirstlane`.
+
 ### Remaining optimization opportunities
 
-1. **LDS m0 hoisting**: The `readfirstlane` on the LDS destination address contains `((k+1)&1)*16384` for double buffering. This alternates between two values. Could precompute both LDS base pairs (slot0 and slot1) as SGPRs before the loop and select with `(k+1)&1`.
+1. **Fine-grained soffset management**: HipKittens uses a single SGPR for soffset and increments it with `s_add_u32` each iteration instead of recomputing `base + k*stride`. This saves one SALU multiply per load. Would require emitting an SGPR variable before the loop and incrementing inside.
 
-2. **Fine-grained soffset management**: HipKittens uses a single SGPR for soffset and increments it with `s_add_u32` each iteration instead of recomputing `base + k*stride`. This saves one SALU multiply per load. Would require emitting an SGPR variable before the loop and incrementing inside.
+2. **Inspect assembly**: Compile to assembly (`bash examples/gemm/compile.sh && bash examples/gemm/pure.sh`) and count instructions between consecutive `buffer_load_dwordx4` to see how close we are to HipKittens' ~3 instructions. The main remaining cost should be the LDS m0 readfirstlane.
 
-3. **Inspect assembly**: Compile to assembly (`bash examples/gemm/compile.sh && bash examples/gemm/pure.sh`) and count instructions between consecutive `buffer_load_dwordx4` to see how close we are to HipKittens' ~3 instructions. The main remaining cost should be the LDS m0 readfirstlane.
-
-4. **Scheduling barrier placement around G2S**: Currently `sched_barrier(0)` is used around S2R/MFMA blocks but not around G2S loads. Adding barriers around the G2S section could prevent LLVM from interleaving G2S address math with other instructions.
+3. **Scheduling barrier placement around G2S**: Currently `sched_barrier(0)` is used around S2R/MFMA blocks but not around G2S loads. Adding barriers around the G2S section could prevent LLVM from interleaving G2S address math with other instructions.
 
 ### Key TVM/TIR APIs used in codegen
 

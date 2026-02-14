@@ -121,6 +121,12 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 
+    TL_INTERLEAVE_G2S = "tl.interleave_g2s"
+    """Interleave G2S (Global-to-Shared) loads with MFMA compute stages.
+    When enabled, distributes G2S loads across MFMA phases instead of
+    batching them before compute, enabling deeper vmcnt pipelining.
+    Only applies to HIP/ROCm targets. Default: False"""
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())

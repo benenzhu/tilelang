@@ -12,6 +12,13 @@ def _is_hip_target(target: Target) -> bool:
     return target.kind.name == "hip"
 
 
+def _should_interleave_g2s(pass_ctx: PassContext | None = None) -> bool:
+    """Check if G2S/MFMA interleaving is enabled."""
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_INTERLEAVE_G2S, False))
+
+
 def should_print_ir_when_change(pass_ctx: PassContext | None = None) -> bool:
     """Check if IR should be printed when a pass causes changes."""
     if pass_ctx is None:
@@ -308,6 +315,14 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     print_pass(mod, "LowerOpaqueBlock")
     mod = tilelang.transform.Simplify()(mod)
     print_pass(mod, "Simplify")
+
+    # Interleave G2S loads with MFMA compute stages (HipKittens-style)
+    if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
+        import sys
+        print("[DEBUG] Applying InterleaveG2SWithCompute pass", file=sys.stderr)
+        mod = tilelang.transform.InterleaveG2SWithCompute()(mod)
+        print_pass(mod, "InterleaveG2SWithCompute")
+
     mod = tir.transform.NarrowDataType(32)(mod)
     print_pass(mod, "NarrowDataType")
     mod = tilelang.transform.FlattenBuffer()(mod)

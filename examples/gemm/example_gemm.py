@@ -32,7 +32,9 @@ os.system("rm *.s")
 
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], pass_configs={
+    tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
+})
 def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
     @T.prim_func
     def gemm(
@@ -54,7 +56,7 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_shared)
-                T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True)
+                T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
             
             T.copy(C_local, C[by * block_M, bx * block_N])
     
