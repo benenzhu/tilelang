@@ -1,0 +1,156 @@
+[128][64] As[2][2]
+[128][64] Bs[2][2]
+
+[64][64] A_tile
+[32][64] B_tile
+
+row__0_1
+col__0_3
+
+Gl(Bs[0][0],   b[col*2  ][0])
+Gl(As[0][0],   a[row*2  ][0])
+Gl(Bs[0][1],   b[col*2+1][0])
+Gl(As[0][1],   a[row*2+1][0])      128 * 64 element => /512 * 8 = 2 instr
+                                   how to load for each warp?
+
+Gl(Bs[1][0],   b[col*2  ][1])
+Gl(As[1][0],   a[row*2  ][1])
+Gl(Bs[1][1],   b[col*2+1][1])
+
+vmcnt(6) :// 上面的 As[0][1] 都是能用的了.. 先不考虑 pingpong 这里..
+vmcnt(0) :
+for:
+-----------------------------
+vmcnt(12)
+load(B_tile_0, Bs[0][0](w_col)) // 7 * 2 = 14
+vmcnt(10)
+load(A_tile,   As[0][0](w_row)) // 5 * 2 = 10
+Gl(As[1][1],   a[row*2+1][1])
+mma(A_tile, B_tile_0)
+------------------------------
+vmcnt(10)
+load(B_tile_1, Bs[0][1](col)) // 5 * 2 = 10
+Gl(Bs[0][0],   b[col*2  ][0])
+mma(A_tile, B_tile_1)
+------------------------------
+vmcnt(10)
+load(A_tile, As[0][1](row)) // 5 * 2 = 10
+lgkmcnt(0)
+Gl(As[0][0],   a[row*2  ][0])
+mma(A_tile, B_tile_0)
+----------------------------
+vmcnt(10)
+load(B_tile_0, Bs[1][0])  // 5 * 2 = 10
+Gl(Bs[0][1],   b[col*2+1][0])
+mma(A_tile, B_tile_1)
+----------------------------
+vmcnt(10)
+load(A_tile,   As[1][0][w_row]) // 5 * 2 = 10
+Gl(As[0][1],  ....)
+mma(A_tile, B_tile_0)
+----------------------------
+vmcnt(10)
+load(B_tile_1, Bs[1][1][w_col]) // 5 * 2 = 10
+Gl(Bs[1][0],    b[col*2])
+lkgmcnt(0)
+mma(A_tile, B_tile_1)
+----------------------------
+vmcnt(10)
+load(A_tile, As[1][1](warp_row)) // 5 * 2 = 10
+Gl(As[1][0], a[row*2][1])
+mma(A_tile, B_tile_0)
+----------------------------
+Gl(Bs[1][1], b[col*2+1][1])
+mma(A_tile, B_tile_1)
+
+
+
+for:
+-----------------------------
+vmcnt(xx)
+load(B_tile_0, Bs[k&1][0](w_col)) // 7 * 2 = 14
+vmcnt(xx)
+load(A_tile,   As[k&1][0](w_row)) // 5 * 2 = 10
+Gl(As[(k+1)&1][1],   a[row*2+1][1])
+mma(A_tile, B_tile_0)
+------------------------------
+vmcnt(xx)
+load(B_tile_1, Bs[k&1][1](col)) // 5 * 2 = 10
+Gl(Bs[k&1][0],   b[col*2  ][0])
+mma(A_tile, B_tile_1)
+------------------------------
+vmcnt(xx)
+load(A_tile, As[k&1][1](row)) // 5 * 2 = 10
+lgkmcnt(0)
+Gl(As[k&1][0],   a[row*2  ][0])
+mma(A_tile, B_tile_0)
+----------------------------
+vmcnt(10)
+load(B_tile_0, Bs[k&1][0])  // 5 * 2 = 10
+Gl(Bs[k&1][1],   b[col*2+1][0])
+mma(A_tile, B_tile_1)
+// ----------------------------
+// vmcnt(10)
+// load(A_tile,   As[1][0][w_row]) // 5 * 2 = 10
+// Gl(As[0][1],  ....)
+// mma(A_tile, B_tile_0)
+// ----------------------------
+// vmcnt(10)
+// load(B_tile_1, Bs[1][1][w_col]) // 5 * 2 = 10
+// Gl(Bs[1][0],    b[col*2])
+// lkgmcnt(0)
+// mma(A_tile, B_tile_1)
+// ----------------------------
+// vmcnt(10)
+// load(A_tile, As[1][1](warp_row)) // 5 * 2 = 10
+// Gl(As[1][0], a[row*2][1])
+// mma(A_tile, B_tile_0)
+// ----------------------------
+// Gl(Bs[1][1], b[col*2+1][1])
+// mma(A_tile, B_tile_1)
+//
+
+
+
+// k = 0
+GL(As[1][1])
+load(As[0][0])   mma
+load(Bs[0][0])
+--------------------
+GL(As[0][0])
+load(Bs[0][1])   mma
+--------------------
+Gl(Bs[0][0])
+load(As[0][1])   mma
+--------------------
+GL(Bs[0][1])     mma
+--------------------
+// k = 1
+GL(As[0][1])
+load(Bs[1][0])
+load(As[1][0])   mma
+--------------------
+GL(As[1][0])
+load(Bs[1][1])   mma
+--------------------
+Gl(Bs[1][0])
+load(As[1][1])   mma
+--------------------
+GL(Bs[1][1])     mma
+--------------------
+// k = 2
+GL(As[1][1])
+vmcnt(12)
+load(As[0][0])   mma
+vmcnt(10)
+load(Bs[0][0])
+--------------------
+GL(As[0][0])
+vmcnt(10)
+load(Bs[0][1])   mma
+--------------------
+Gl(Bs[0][0])
+// vmcnt(10)
+load(As[0][1])   mma
+--------------------
+GL(Bs[0][1])     mma⏎                                    

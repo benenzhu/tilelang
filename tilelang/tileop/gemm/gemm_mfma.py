@@ -211,12 +211,9 @@ class GemmMFMA(GemmBase):
             @T.prim_func
             def _gemm_srr() -> None:
                 """
-                The inner macro that loads data from shared buffer A_shared
-                into local fragments, then issues Matrix Core mfma ops with
-                B already in registers, accumulating into C_local.
-
-                S2R loads for A are interleaved with MFMA compute on a
-                per-warp-row basis.
+                The inner macro that loads data from shared buffers A_shared and
+                B_shared into local fragments, then issues Matrix Core mfma ops,
+                accumulating into C_local.
                 """
                 A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
 
@@ -224,26 +221,15 @@ class GemmMFMA(GemmBase):
                     T.clear(C_buf)
 
                 for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
-                    # Load first row of A (ensures A_local declared
-                    # before B in codegen -- workaround for HIP
-                    # compiler VGPR allocation issue)
-                    mfma_emitter.ldmatrix_a_single(
+                    # Load A into fragment
+                    mfma_emitter.ldmatrix_a(
                         A_local,
                         A_region,
                         ki,
-                        T.int32(0),
                     )
-                    # MFMA for row 0
-                    mfma_emitter.mfma_slice(A_local, B_buf, C_buf, ki, T.int32(0))
-                    # Interleave: remaining rows of A + MFMA
-                    for ri in T.serial(1, warp_rows):
-                        mfma_emitter.ldmatrix_a_single(
-                            A_local,
-                            A_region,
-                            ki,
-                            ri,
-                        )
-                        mfma_emitter.mfma_slice(A_local, B_buf, C_buf, ki, ri)
+
+                    # Perform Matrix Multiplication
+                    mfma_emitter.mfma(A_local, B_buf, C_buf, ki)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
@@ -256,9 +242,9 @@ class GemmMFMA(GemmBase):
             @T.prim_func
             def _gemm_rsr() -> None:
                 """
-                The inner macro that loads data from shared buffer B_shared
-                into local fragments, with A already in registers, then issues
-                Matrix Core mfma ops, accumulating into C_local.
+                The inner macro that loads data from shared buffers A_shared and
+                B_shared into local fragments, then issues Matrix Core mfma ops,
+                accumulating into C_local.
                 """
                 B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
                 if clear_accum:
