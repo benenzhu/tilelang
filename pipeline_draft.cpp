@@ -111,11 +111,20 @@ mma(A_tile, B_tile_1)
 //
 
 
+    
+// before loop
+GL(As[0][0])
+GL(Bs[0][0])
+GL(As[0][1])
+GL(Bs[0][1])
+GL(As[1][0])
+GL(Bs[1][0])
+GL(Bs[1][1])
 
 // k = 0
 GL(As[1][1])
-load(As[0][0])   mma
-load(Bs[0][0])
+load(As[0][0])   
+load(Bs[0][0])   mma
 --------------------
 GL(As[0][0])
 load(Bs[0][1])   mma
@@ -127,8 +136,8 @@ GL(Bs[0][1])     mma
 --------------------
 // k = 1
 GL(As[0][1])
-load(Bs[1][0])
-load(As[1][0])   mma
+load(As[1][0])   
+load(Bs[1][0])   mma
 --------------------
 GL(As[1][0])
 load(Bs[1][1])   mma
@@ -140,17 +149,75 @@ GL(Bs[1][1])     mma
 --------------------
 // k = 2
 GL(As[1][1])
-vmcnt(12)
-load(As[0][0])   mma
-vmcnt(10)
-load(Bs[0][0])
+load(As[0][0])   
+load(Bs[0][0])   mma 
 --------------------
 GL(As[0][0])
-vmcnt(10)
 load(Bs[0][1])   mma
 --------------------
 Gl(Bs[0][0])
-// vmcnt(10)
 load(As[0][1])   mma
 --------------------
 GL(Bs[0][1])     mma⏎                                    
+
+
+
+
+
+一个tile: 
+
+
+G::load(A) :: // (256 * 64 / 512) = 32 ele.  32 / 8 = ... 4 load
+
+
+local: 
+
+A[0] B[0] B[1]:   A: 64 * 64 / 64 = 64 ele. 64 / 8 = 8 load...  * 3 = 24 load.
+
+
+
+
+
+// k = 0
+load(As[0][0])  // 8 load_128
+load(Bs[0][0])  // 4 load_128
+GL(As[1][1])    // 2 buffer
+mma
+--------------------
+load(Bs[0][1])  // 4 load_128
+GL(As[0][0])    // 2 buffer
+mma
+--------------------
+load(As[0][1])  // 8 load_128
+Gl(Bs[0][0])    // 2 buffer
+mma
+--------------------
+GL(Bs[0][1])    // 2 buffer
+mma
+--------------------
+// k = 1
+GL(As[0][1])
+load(As[1][0])   
+load(Bs[1][0])   mma
+--------------------
+GL(As[1][0])
+load(Bs[1][1])   mma
+--------------------
+Gl(Bs[1][0])
+load(As[1][1])   mma
+--------------------
+GL(Bs[1][1])     mma
+--------------------
+// k = 2
+GL(As[1][1])
+load(As[0][0])   
+load(Bs[0][0])   mma 
+--------------------
+GL(As[0][0])
+load(Bs[0][1])   mma
+--------------------
+Gl(Bs[0][0])
+load(As[0][1])   mma
+--------------------
+GL(Bs[0][1])     mma⏎                                    
+

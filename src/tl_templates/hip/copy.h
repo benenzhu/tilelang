@@ -76,6 +76,10 @@ template <int N = 0> TL_DEVICE void cp_async_wait() {
   // async_gld_sld_fence(N);
 }
 
+// Direct vmcnt control — bypasses InjectPTXAsyncCopy's commit group tracking.
+// Usage: tl_waitcnt_vmcnt(6) → asm volatile("s_waitcnt vmcnt(6)")
+#define tl_waitcnt_vmcnt(N) asm volatile("s_waitcnt vmcnt(" #N ")" ::: "memory")
+
 template <bool pre_nop = false>
 CK_TILE_DEVICE void async_buffer_load_dword_v(void *smem, int32x4_t rsrc,
                                               index_t voffset) {
