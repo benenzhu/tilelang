@@ -838,11 +838,12 @@ class MatrixCoreIntrinEmitter:
     def mfma_block(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
                    k_inner: PrimExpr | None = 0, row_start: PrimExpr | int = 0,
                    col_offset: PrimExpr | int = 0,
-                   num_rows: int = 2, num_b_cols: int = 4):
+                   num_rows: int = 2, num_b_cols: int = 4,
+                   b_slot_start: int = 0):
         """Compute ``num_rows * num_b_cols * k_pack`` MFMAs in one batch.
 
-        ``B_local_buf`` holds ``num_b_cols`` columns packed contiguously,
-        each consisting of ``k_pack * local_size_b`` elements.
+        ``B_local_buf`` holds columns packed contiguously. ``b_slot_start``
+        selects which slot range to read from (0 for left half, 2 for right).
 
         The MFMA iteration order is *col-major* (outer: B-slot, inner: A-row)
         so the same B vector is reused for ``num_rows`` consecutive MFMAs.
@@ -871,7 +872,7 @@ class MatrixCoreIntrinEmitter:
                     compute_b_dtype,
                     compute_out_dtype,
                     B_local_buf.data,
-                    (slot * k_pack + kp),
+                    ((b_slot_start + slot) * k_pack + kp),
                     A_local_buf.data,
                     (a_local_stride + ((row_start + ri) * k_pack + kp) * local_size_a) // local_size_a,
                     C_local_buf.data,

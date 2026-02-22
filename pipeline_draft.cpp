@@ -221,3 +221,20 @@ load(As[0][1])   mma
 --------------------
 GL(Bs[0][1])     mma⏎                                    
 
+
+// k = 0
+load(As[k][0])  // 8 load_128
+load(Bs[k][0])  // 4 load_128
+GL(As[k + 1][1])    // 2 buffer
+mma
+--------------------
+load(Bs[k][1])  // 4 load_128
+GL(As[k + 2][0])    // 2 buffer
+mma
+--------------------
+load(As[k][1])  // 8 load_128
+Gl(Bs[k + 2][0])    // 2 buffer
+mma
+--------------------
+GL(Bs[k + 2][1])    // 2 buffer
+mma

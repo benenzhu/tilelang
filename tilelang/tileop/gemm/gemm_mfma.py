@@ -134,73 +134,27 @@ class GemmMFMA(GemmBase):
 
             @T.prim_func
             def _gemm_ssr() -> None:
-                """
-                4-stage S2R GEMM schedule (gemm_ss), k_pack=1.
-
-                Per ki iteration (repeated 2x for block_K=64, micro_k=32):
-                  Stage 0: load A row{0,1} + B col{0..3} (6 ds_read) -> 8 MFMA
-                  Stage 1: load A row{2,3}  (2 ds_read, reuse B) -> 8 MFMA
-                  Stage 2: load B col{4,5}  (2 ds_read, reuse A) -> 8 MFMA
-                  Stage 3: load B col{6,7}  (2 ds_read, reuse A) -> 8 MFMA
-
-                Totals per ki: 12 ds_read, 32 MFMA
-                Totals overall: 24 ds_read, 64 MFMA
-                """
-                k_pack = self.k_pack if self.k_pack is not None else 1
-                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
-                # B_local expanded to 4 cols for stages 0-1
-                B_local = T.alloc_local((4 * local_size_b * k_pack), in_dtype)
+                A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
+                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
+                    # Load A into fragment
+                    mfma_emitter.ldmatrix_a(
+                        A_local,
+                        A_region,
+                        ki,
+                    )
 
-                    # ═══════ Stage 0: A row{0,1} + B col{0,1,2,3} -> 8 MFMA ═══════
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(0))
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(1))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(0), T.int32(0))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(1), T.int32(1))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(2), T.int32(2))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(3), T.int32(3))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
-                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
-                                            row_start=T.int32(0), col_offset=T.int32(0),
-                                            num_rows=2, num_b_cols=4)
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
+                    # Load B into fragment
+                    mfma_emitter.ldmatrix_b(
+                        B_local,
+                        B_region,
+                        ki,
+                    )
 
-                    # ═══════ Stage 1: A row{2,3}, reuse B -> 8 MFMA ═══════
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(2))
-                    mfma_emitter.ldmatrix_a_single(A_local, A_region, ki, T.int32(3))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
-                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
-                                            row_start=T.int32(2), col_offset=T.int32(0),
-                                            num_rows=2, num_b_cols=4)
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
-
-                    # ═══════ Stage 2: B col{4,5}, A fully loaded -> 8 MFMA ═══════
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(4), T.int32(0))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(5), T.int32(1))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
-                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
-                                            row_start=T.int32(0), col_offset=T.int32(4),
-                                            num_rows=4, num_b_cols=2)
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
-
-                    # ═══════ Stage 3: B col{6,7} -> 8 MFMA ═══════
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(6), T.int32(0))
-                    mfma_emitter.ldmatrix_b_to_slot(B_local, B_region, ki, T.int32(7), T.int32(1))
-                    tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", tir.IntImm("int32", 0))
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 1))
-                    mfma_emitter.mfma_block(A_local, B_local, C_buf, ki,
-                                            row_start=T.int32(0), col_offset=T.int32(6),
-                                            num_rows=4, num_b_cols=2)
-                    tir.call_extern("int32", "__builtin_amdgcn_s_setprio", tir.IntImm("int32", 0))
+                    # Perform Matrix Multiplication
+                    mfma_emitter.mfma(A_local, B_local, C_buf, ki)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
