@@ -32,7 +32,9 @@ os.system("rm *.s")
 
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], pass_configs={
+    tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
+})
 def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
     @T.prim_func
     def gemm(

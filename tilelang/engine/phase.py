@@ -318,8 +318,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Interleave G2S with MFMA compute (HipKittens-style)
     if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
-        # mod = tilelang.transform.InterleaveG2SWithCompute()(mod)
-        mod = tilelang.transform.InjectCdna4Pipeline()(mod)
+        mod = tilelang.transform.InterleaveG2SWithCompute()(mod)
         print_pass(mod, "InterleaveG2SWithCompute")
 
     mod = tir.transform.NarrowDataType(32)(mod)

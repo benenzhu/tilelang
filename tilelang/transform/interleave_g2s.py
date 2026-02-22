@@ -20,6 +20,7 @@ from tvm import tir
 from tvm.tir import (
     Allocate,
     AttrStmt,
+    BufferStore,
     DeclBuffer,
     Evaluate,
     For,
@@ -232,43 +233,250 @@ def _split_into_stages(stmts: list[Stmt]) -> list[list[Stmt]] | None:
     return stages
 
 
+def _make_sched_barrier() -> Stmt:
+    """Create a sched_barrier(0) call."""
+    return Evaluate(
+        tir.call_extern("int32", "__builtin_amdgcn_sched_barrier", IntImm("int32", 0))
+    )
+
+
+def _make_setprio_stmt(val: int) -> Stmt:
+    """Create a setprio call."""
+    return Evaluate(
+        tir.call_extern("int32", "__builtin_amdgcn_s_setprio", IntImm("int32", val))
+    )
+
+
+def _contains_mfma(node) -> bool:
+    """Recursively check if a TIR node contains a tvm_mfma call."""
+    if isinstance(node, Evaluate):
+        call = node.value
+        if isinstance(call, tir.Call):
+            # tvm_mfma can appear as tir.tvm_mfma or via call_extern
+            if hasattr(call.op, 'name'):
+                op_name = call.op.name
+                if "mfma" in op_name:
+                    return True
+                # Check call_extern with mfma function name
+                if op_name == "tir.call_extern" and len(call.args) > 0:
+                    arg0 = call.args[0]
+                    if isinstance(arg0, tir.StringImm) and "mfma" in arg0.value:
+                        return True
+    if isinstance(node, For):
+        return _contains_mfma(node.body)
+    if isinstance(node, SeqStmt):
+        return any(_contains_mfma(s) for s in node)
+    if isinstance(node, AttrStmt):
+        return _contains_mfma(node.body)
+    return False
+
+
+def _unroll_serial_fors(node: For) -> list[Stmt]:
+    """Recursively unroll all serial For loops, preserving Vectorized loops."""
+    if node.kind == ForKind.VECTORIZED:
+        return [node]
+
+    var = node.loop_var
+    extent = int(node.extent)
+    min_val = int(node.min)
+    result = []
+    for i in range(extent):
+        val = IntImm(var.dtype, min_val + i)
+        body = substitute(node.body, {var: val})
+        if isinstance(body, For) and body.kind != ForKind.VECTORIZED:
+            result.extend(_unroll_serial_fors(body))
+        else:
+            result.append(body)
+    return result
+
+
+def _is_s2r_loop(node: For) -> bool:
+    """Check if a For loop is an S2R (Shared-to-Register) load loop.
+
+    S2R loops write to a local buffer from a shared buffer, and contain
+    a vectorized inner loop.
+    """
+    if not isinstance(node, For) or node.kind != ForKind.SERIAL:
+        return False
+
+    # Walk down to find a BufferStore
+    body = node.body
+    while isinstance(body, For):
+        if body.kind == ForKind.VECTORIZED:
+            body = body.body
+            break
+        body = body.body
+
+    if isinstance(body, BufferStore):
+        dst_scope = body.buffer.scope()
+        return dst_scope == "local"
+    return False
+
+
+def _create_stages_from_raw_consumer(consumer_body: Stmt):
+    """Create 4 MFMA stages from raw consumer body without sched_barrier markers.
+
+    Identifies S2R A/B loops and MFMA loop, unrolls them, and groups into
+    4 stages split by kp (k_pack dimension) and j-half (warp column halves).
+
+    Each stage format: [sched_barrier, S2R_loads..., sched_barrier, setprio(1), MFMAs..., setprio(0)]
+
+    Returns (stages_list, alloc_wrappers) or None on failure.
+    """
+    inner_body, wrappers = _unwrap_alloc_decl(consumer_body)
+    stmts = _flatten_seq(inner_body)
+
+    # Identify the three loop groups: S2R A, S2R B, MFMA
+    s2r_loops = []
+    mfma_loop = None
+    for s in stmts:
+        if isinstance(s, For) and s.kind == ForKind.SERIAL:
+            if _contains_mfma(s):
+                mfma_loop = s
+            elif _is_s2r_loop(s):
+                s2r_loops.append(s)
+
+    if len(s2r_loops) != 2 or mfma_loop is None:
+        return None
+
+    s2r_a_loop, s2r_b_loop = s2r_loops
+
+    # Validate MFMA loop structure: For(kp, 0, 2, For(i, .., For(j, .., mfma)))
+    if not (isinstance(mfma_loop, For) and int(mfma_loop.extent) == 2):
+        return None
+    i_loop = mfma_loop.body
+    if not isinstance(i_loop, For):
+        return None
+    j_loop = i_loop.body
+    if not isinstance(j_loop, For):
+        return None
+    warp_cols = int(j_loop.extent)
+    j_split = warp_cols // 2
+
+    # Validate S2R loops have local_id=2 inner dimension (k_pack=2)
+    s2r_a_inner = s2r_a_loop.body
+    s2r_b_inner = s2r_b_loop.body
+    if not (isinstance(s2r_a_inner, For) and int(s2r_a_inner.extent) == 2):
+        return None
+    if not (isinstance(s2r_b_inner, For) and int(s2r_b_inner.extent) == 2):
+        return None
+
+    # Unroll S2R A by (outer_dim, local_id) -> list of vectorized For stmts
+    a_loads = _unroll_serial_fors(s2r_a_loop)
+    b_loads = _unroll_serial_fors(s2r_b_loop)
+
+    # S2R A: unrolled as (i_1=0,lid=0), (i_1=0,lid=1), (i_1=1,lid=0), ...
+    # Split by local_id: even indices = kp=0, odd = kp=1
+    a_kp0 = a_loads[0::2]  # local_id=0
+    a_kp1 = a_loads[1::2]  # local_id=1
+
+    # S2R B: unrolled as (j=0,lid=0), (j=0,lid=1), (j=1,lid=0), ...
+    # Split by local_id and j-half
+    b_kp0 = b_loads[0::2]  # local_id=0, all j
+    b_kp1 = b_loads[1::2]  # local_id=1, all j
+    b_kp0_lo = b_kp0[:j_split]   # j=0..j_split-1
+    b_kp0_hi = b_kp0[j_split:]   # j=j_split..N-1
+    b_kp1_lo = b_kp1[:j_split]
+    b_kp1_hi = b_kp1[j_split:]
+
+    # Unroll MFMA: (kp, i, j) -> list of Evaluate stmts
+    mfma_ops = _unroll_serial_fors(mfma_loop)
+    # Total = 2 * warp_rows * warp_cols
+    warp_rows = int(i_loop.extent)
+    mfma_per_kp = warp_rows * warp_cols
+    mfma_kp0 = mfma_ops[:mfma_per_kp]
+    mfma_kp1 = mfma_ops[mfma_per_kp:]
+
+    # Split each kp's MFMAs by j-half
+    # Within kp: order is (i=0,j=0..N-1), (i=1,j=0..N-1), ...
+    def _split_j(ops, n_cols, split):
+        lo, hi = [], []
+        for idx, op in enumerate(ops):
+            j_val = idx % n_cols
+            if j_val < split:
+                lo.append(op)
+            else:
+                hi.append(op)
+        return lo, hi
+
+    mfma_kp0_lo, mfma_kp0_hi = _split_j(mfma_kp0, warp_cols, j_split)
+    mfma_kp1_lo, mfma_kp1_hi = _split_j(mfma_kp1, warp_cols, j_split)
+
+    # Build 4 stages
+    def _build_stage(s2r_list: list[Stmt], mfma_list: list[Stmt]) -> list[Stmt]:
+        stage = [_make_sched_barrier()]
+        stage.extend(s2r_list)
+        stage.append(_make_sched_barrier())
+        stage.append(_make_setprio_stmt(1))
+        stage.extend(mfma_list)
+        stage.append(_make_setprio_stmt(0))
+        return stage
+
+    stages = [
+        _build_stage(a_kp0 + b_kp0_lo, mfma_kp0_lo),   # Stage 0
+        _build_stage(b_kp0_hi, mfma_kp0_hi),             # Stage 1
+        _build_stage(a_kp1 + b_kp1_lo, mfma_kp1_lo),     # Stage 2
+        _build_stage(b_kp1_hi, mfma_kp1_hi),              # Stage 3
+    ]
+
+    return stages, wrappers
+
+
 def _extract_consumer_stages(consumer_body: Stmt):
     """Extract MFMA stages from the consumer block.
 
     Handles both:
     - ki-loop consumer (k_pack=1): For(ki, ...) containing stages
     - Direct consumer (k_pack=2): stages directly in the body
+    - Raw consumer (no sched_barriers): auto-creates stages by splitting loops
 
     Returns (stages_list, alloc_wrappers) or None on failure.
     """
     inner_body, wrappers = _unwrap_alloc_decl(consumer_body)
 
     # Check if inner_body is a For loop (ki-loop case)
+    # Only treat as ki-loop if it contains sched_barrier markers inside
     if isinstance(inner_body, For) and inner_body.kind == ForKind.SERIAL:
         ki_loop = inner_body
         loop_var = ki_loop.loop_var
         extent = int(ki_loop.extent)
         ki_inner, ki_wrappers = _unwrap_alloc_decl(ki_loop.body)
 
-        all_stages = []
-        for ki_val in range(extent):
-            unrolled = substitute(ki_inner, {loop_var: IntImm(loop_var.dtype, ki_val)})
-            stmts = _flatten_seq(unrolled)
-            stages = _split_into_stages(stmts)
-            if stages is None:
-                return None
-            all_stages.extend(stages)
+        # Check if inner body has sched_barrier markers (true ki-loop with stages)
+        ki_stmts = _flatten_seq(substitute(ki_inner, {loop_var: IntImm(loop_var.dtype, 0)}))
+        test_stages = _split_into_stages(ki_stmts)
+        if test_stages is not None:
+            all_stages = []
+            for ki_val in range(extent):
+                unrolled = substitute(ki_inner, {loop_var: IntImm(loop_var.dtype, ki_val)})
+                stmts = _flatten_seq(unrolled)
+                stages = _split_into_stages(stmts)
+                if stages is None:
+                    return None
+                all_stages.extend(stages)
+            all_wrappers = wrappers + ki_wrappers
+            return all_stages, all_wrappers
 
-        # Merge both wrapper levels
-        all_wrappers = wrappers + ki_wrappers
-        return all_stages, all_wrappers
-
-    # Direct case (no ki loop) — stages directly in inner_body
+    # Direct case — stages directly in inner_body (with sched_barrier markers)
     stmts = _flatten_seq(inner_body)
     stages = _split_into_stages(stmts)
-    if stages is None:
-        return None
-    return stages, wrappers
+    if stages is not None:
+        return stages, wrappers
+
+    # Fallback: no sched_barrier stages, auto-create from raw S2R + MFMA loops
+    result = _create_stages_from_raw_consumer(consumer_body)
+    if result is None:
+        print(f"[InterleaveG2S] _create_stages_from_raw_consumer failed")
+        # Debug: show what we found
+        inner_dbg, wrappers_dbg = _unwrap_alloc_decl(consumer_body)
+        stmts_dbg = _flatten_seq(inner_dbg)
+        print(f"[InterleaveG2S]   inner type: {type(inner_dbg).__name__}, wrappers: {len(wrappers_dbg)}")
+        print(f"[InterleaveG2S]   flattened stmts: {len(stmts_dbg)}")
+        for i, s in enumerate(stmts_dbg):
+            print(f"[InterleaveG2S]   stmt[{i}]: {type(s).__name__}, kind={getattr(s, 'kind', 'N/A')}")
+            if isinstance(s, For):
+                print(f"[InterleaveG2S]     extent={s.extent}, is_s2r={_is_s2r_loop(s)}, has_mfma={_contains_mfma(s)}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +554,14 @@ def _build_interleaved_body(
         # Part 3: Second sched_barrier
         new_stage.append(stage_stmts[insert_idx])
 
-        # Part 4: MFMA block, last stage gets vmcnt(0) wait
+        # Part 4: MFMA block, last stage gets vmcnt(0) wait + s_barrier
         remaining_stmts = stage_stmts[insert_idx + 1:]
         if i == num_stages - 1:
             # Last stage: wrap MFMA in async_wait(0) to drain all G2S
-            remaining_body = SeqStmt(remaining_stmts) if len(remaining_stmts) > 1 else remaining_stmts[0]
+            barrier_call = Evaluate(
+                tir.call_extern("int32", "__builtin_amdgcn_s_barrier"),
+            )
+            remaining_body = SeqStmt(remaining_stmts + [barrier_call]) if remaining_stmts else barrier_call
             wait_wrapped = _make_async_wait_wrapping(0, remaining_body)
             new_stage.append(wait_wrapped)
         else:
@@ -378,17 +589,26 @@ def _try_interleave_loop_body(loop: For) -> Stmt | None:
     # 1. Find G2S async blocks
     g2s_a, g2s_b, remaining = _find_async_blocks(body_stmts)
     if g2s_a is None or g2s_b is None:
+        print(f"[InterleaveG2S] G2S blocks not found: g2s_a={g2s_a is not None}, g2s_b={g2s_b is not None}")
         return None
+
+    print(f"[InterleaveG2S] Found G2S: A={len(g2s_a)}, B={len(g2s_b)}, remaining={len(remaining)}")
 
     # 2. Find consumer block
     consumer_body, _found = _find_consumer(remaining)
     if consumer_body is None:
+        print("[InterleaveG2S] Consumer not found")
         return None
+
+    print(f"[InterleaveG2S] Consumer found, type={type(consumer_body).__name__}")
 
     # 3. Extract MFMA stages
     result = _extract_consumer_stages(consumer_body)
     if result is None:
+        print("[InterleaveG2S] Failed to extract MFMA stages")
         return None
+
+    print(f"[InterleaveG2S] Got {len(result[0])} stages")
     mfma_stages, alloc_wrappers = result
     if len(mfma_stages) == 0:
         return None
