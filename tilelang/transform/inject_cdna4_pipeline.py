@@ -145,7 +145,6 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
         return None
 
     # 2. Distribute G2S across 4 stages evenly
-    # With 8 G2S and 4 stages: 2 per stage
     g2s_per_stage = (num_g2s + 3) // 4
 
     phase_stmts = []

@@ -421,9 +421,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     print_pass(mod, "InjectPTXAsyncCopy")
     # Remove spurious tvm_storage_sync inserted by ThreadSync when
     # InjectCdna4Pipeline already handles synchronization with vmcnt + s_barrier
-    #if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
-    #    mod = tilelang.transform.RemoveRedundantSync()(mod)
-    #    print_pass(mod, "RemoveRedundantSync")
+    if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
+        mod = tilelang.transform.RemoveRedundantSync()(mod)
+        print_pass(mod, "RemoveRedundantSync")
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
         print_pass(mod, "AnnotateWarpGroupRegAlloc")
