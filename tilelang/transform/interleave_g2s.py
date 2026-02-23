@@ -584,6 +584,81 @@ def _create_stages_from_raw_consumer(consumer_body: Stmt):
     return stages, wrappers
 
 
+def _create_stages_from_scattered_consumer(consumer_body: Stmt):
+    """Create stages from a scattered warp layout consumer.
+
+    The scattered consumer has a `for sub_m, sub_n in grid(2, 2)` outer loop,
+    where each iteration contains S2R_A, S2R_B, and MFMA for one quadrant.
+    Each iteration is a natural stage — just unroll the loop.
+
+    Returns (stages_list, alloc_wrappers) or None if not a scattered consumer.
+    """
+    inner_body, wrappers = _unwrap_alloc_decl(consumer_body)
+
+    # Must be a For loop (the sub_m loop, or a fused sub_m*sub_n loop)
+    if not isinstance(inner_body, For) or inner_body.kind != ForKind.SERIAL:
+        return None
+
+    outer_loop = inner_body
+    outer_var = outer_loop.loop_var
+    outer_extent = int(outer_loop.extent)
+
+    # Check if the body is another For (sub_n loop)
+    inner_after_unwrap, inner_wrappers = _unwrap_alloc_decl(outer_loop.body)
+
+    if isinstance(inner_after_unwrap, For) and inner_after_unwrap.kind == ForKind.SERIAL:
+        inner_loop = inner_after_unwrap
+        inner_var = inner_loop.loop_var
+        inner_extent = int(inner_loop.extent)
+
+        # Verify this looks like a scattered consumer: inner body should have S2R + MFMA
+        test_body = inner_loop.body
+        test_unwrapped, _ = _unwrap_alloc_decl(test_body)
+        test_stmts = _flatten_seq(test_unwrapped)
+        has_s2r = any(isinstance(s, For) and _is_s2r_loop(s) for s in test_stmts)
+        has_mfma = any(_contains_mfma(s) for s in test_stmts)
+        if not (has_s2r and has_mfma):
+            return None
+
+        # Unroll both loops to create stages
+        stages = []
+        for om in range(outer_extent):
+            for im in range(inner_extent):
+                substituted = substitute(
+                    inner_loop.body,
+                    {outer_var: IntImm(outer_var.dtype, om),
+                     inner_var: IntImm(inner_var.dtype, im)})
+                sub_body, sub_wrappers = _unwrap_alloc_decl(substituted)
+                sub_stmts = _flatten_seq(sub_body)
+
+                # Separate S2R loads and MFMA calls
+                s2r_stmts = []
+                mfma_stmts = []
+                for s in sub_stmts:
+                    if isinstance(s, For) and _is_s2r_loop(s):
+                        s2r_stmts.extend(_unroll_serial_fors(s))
+                    elif _contains_mfma(s):
+                        if isinstance(s, For):
+                            mfma_stmts.extend(_unroll_serial_fors(s))
+                        else:
+                            mfma_stmts.append(s)
+
+                # Build stage: sched_barrier + S2R + sched_barrier + setprio(1) + MFMA + setprio(0)
+                stage = [_make_sched_barrier()]
+                stage.extend(s2r_stmts)
+                stage.append(_make_sched_barrier())
+                stage.append(_make_setprio_stmt(1))
+                stage.extend(mfma_stmts)
+                stage.append(_make_setprio_stmt(0))
+                stages.append(stage)
+
+        all_wrappers = wrappers + inner_wrappers
+        _verify_stage_dependencies(stages)
+        return stages, all_wrappers
+
+    return None
+
+
 def _extract_consumer_stages(consumer_body: Stmt):
     """Extract MFMA stages from the consumer block.
 
@@ -624,6 +699,11 @@ def _extract_consumer_stages(consumer_body: Stmt):
     stages = _split_into_stages(stmts)
     if stages is not None:
         return stages, wrappers
+
+    # Fallback: try scattered consumer (for sub_m, sub_n in grid(2,2): S2R+MFMA)
+    result = _create_stages_from_scattered_consumer(consumer_body)
+    if result is not None:
+        return result
 
     # Fallback: no sched_barrier stages, auto-create from raw S2R + MFMA loops
     return _create_stages_from_raw_consumer(consumer_body)
