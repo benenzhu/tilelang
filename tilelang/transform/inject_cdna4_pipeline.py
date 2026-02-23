@@ -144,7 +144,9 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
     if orig_n is None or orig_n < 2:
         return None
 
-    # 2. Distribute G2S across 4 stages evenly
+    # 2. Build stages — stage-reorder only (no G2S interleaving)
+    # Keep original G2S + async_wait, just replace consumer with reordered stages
+    # 2. Build interleaved stages with G2S distributed across them
     g2s_per_stage = (num_g2s + 3) // 4
 
     phase_stmts = []
@@ -161,20 +163,38 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
             barrier_after=is_last,
         ))
 
-    interleaved = SeqStmt(phase_stmts)
+    reordered_consumer = SeqStmt(phase_stmts)
     if alloc_wrappers:
-        interleaved = _rewrap(interleaved, alloc_wrappers)
+        reordered_consumer = _rewrap(reordered_consumer, alloc_wrappers)
 
-    # 3. Build the loop (same range as original)
-    main_loop = For(
+    # 3. Keep original G2S blocks and async_wait, replace only the consumer body.
+    # This preserves the async_wait(inflight=1) → cp_async_wait<N> synchronization
+    # that ensures the PREVIOUS k's G2S is complete before S2R reads shared memory.
+    # The new G2S stores (interleaved into stages) will be for the NEXT k+1,
+    # so they coexist with the original G2S which loads k+1 via the standard pipeline.
+    new_body_stmts = []
+    for stmt in body_stmts:
+        if isinstance(stmt, AttrStmt) and stmt.attr_key in ("async_scope", "async_commit_queue_scope"):
+            new_body_stmts.append(stmt)  # keep original G2S
+        elif isinstance(stmt, AttrStmt) and stmt.attr_key == "async_wait_queue_scope":
+            # Replace consumer inside async_wait with interleaved version
+            wait_body = stmt.body
+            if isinstance(wait_body, AttrStmt) and wait_body.attr_key == "async_wait_inflight_count":
+                wrapped = AttrStmt(
+                    wait_body.node, wait_body.attr_key, wait_body.value,
+                    reordered_consumer,
+                )
+                new_body_stmts.append(AttrStmt(
+                    stmt.node, stmt.attr_key, stmt.value, wrapped,
+                ))
+            else:
+                new_body_stmts.append(stmt)
+
+    new_body = SeqStmt(new_body_stmts) if len(new_body_stmts) > 1 else new_body_stmts[0]
+    return For(
         k, loop.min, loop.extent,
-        loop.kind, interleaved, loop.thread_binding, loop.annotations,
+        loop.kind, new_body, loop.thread_binding, loop.annotations,
     )
-
-    # 4. Prologue: vmcnt(0) + s_barrier to drain initial G2S before entering loop
-    prologue = SeqStmt([_make_vmcnt(0), _make_s_barrier()])
-
-    return SeqStmt([prologue, main_loop])
 
 
 @tir.functor.mutator
