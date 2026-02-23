@@ -256,7 +256,8 @@ void CodeGenTileLangHIP::VisitStmt_(const tir::ForNode *op) {
   // EmitG2SHoistPrecomputation (it doesn't reference the loop var, but
   // AllocVarID must happen before BeginScope).
   bool is_pipeline_loop = false;
-  if (op->kind == tir::ForKind::kSerial && !in_pipeline_loop_) {
+  static bool g2s_hoist_disabled = (std::getenv("TL_DISABLE_G2S_HOIST") != nullptr);
+  if (!g2s_hoist_disabled && op->kind == tir::ForKind::kSerial && !in_pipeline_loop_) {
     if (auto *ext = op->extent.as<IntImmNode>()) {
       if (ext->value > 1) {
         is_pipeline_loop = true;
