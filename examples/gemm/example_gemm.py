@@ -35,7 +35,7 @@ import tilelang.language as T
 
 @tilelang.jit(out_idx=[-1], pass_configs={
     tilelang.PassConfigKey.TL_SCATTERED_WARP_LAYOUT: True,
-    tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
+    # tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
 })
 def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
     @T.prim_func
@@ -68,7 +68,8 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
 ### TODO(zty): 1. add a new kernel for NT layout? or just transpose B and continues can do?
 
 def main(transpose_b=False):
-    M, N, K = 8192, 8192, 8192
+    # M, N, K = 8192, 8192, 8192
+    M, N, K = 256, 256, 1024
     if not transpose_b:
         assert False, "not implemented"
         kernel = matmul(M, N, K, 128, 128, 32)
@@ -78,12 +79,10 @@ def main(transpose_b=False):
     import torch
 
     a = torch.randn(M, K).cuda().bfloat16()
-    
     if not transpose_b:
         b = torch.randn(K, N).cuda().bfloat16()
         torch.cuda.synchronize()
         print("execute kernel", flush=True)
-        c = kernel(a, b)
         torch.cuda.synchronize()
         print("execute kernel done", flush=True)
         ref_c = a @ b
@@ -92,21 +91,27 @@ def main(transpose_b=False):
         b_nt = torch.randn(N, K).cuda().bfloat16()
         torch.cuda.synchronize()
         print("execute kernel", flush=True)
-        c = kernel(a, b_nt)
         torch.cuda.synchronize()
 
         import time
-        time.sleep(1)
+        # time.sleep(1)
         print("execute kernel done", flush=True)
         ref_c = a @ b_nt.T
 
-    # print("c:")
-    # print(c)
-    # print("ref_c:")
-    # print(ref_c)
-
-    torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-    print("All check passed.")
+    for zz in range(5): 
+        if not transpose_b:
+            c = kernel(a, b)
+        else:
+            c = kernel(a, b_nt)
+        # print("c:")
+        # print(c)
+        # print("ref_c:")
+        # print(ref_c)
+        # print(c - ref_c)
+        if not torch.allclose(c, ref_c, rtol=1e-2, atol=1e-2):
+            print(c - ref_c, c)
+        torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+        print("All check passed.")
 
     # Get CUDA Source
     # print("CUDA Source:")
