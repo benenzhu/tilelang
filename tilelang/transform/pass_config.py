@@ -229,3 +229,9 @@ class PassConfigKey(str, Enum):
 
     TL_DISABLE_OUT_OF_BOUND_WARNING = "tl.disable_out_of_bound_warning"
     """Disable out-of-bound access warnings in safe memory access legalization. Default: False"""
+
+    TL_SCATTERED_WARP_LAYOUT = "tl.scattered_warp_layout"
+    """Enable HipKittens-style scattered warp layout for GEMM.
+    Each warp computes tiles from all 4 quadrants of the output matrix
+    in round-robin order, enabling early release of shared memory
+    regions for G2S overlap. Only applies to SS GEMM on HIP. Default: False"""

@@ -11,6 +11,8 @@ from tvm.ir import Range
 from tvm import tir
 from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
+import tilelang
+from tilelang.transform import PassConfigKey
 
 
 def _is_gfx950() -> bool:
@@ -131,6 +133,52 @@ class GemmMFMA(GemmBase):
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
         if self.is_gemm_ss():
+            # Check if scattered warp layout is enabled via pass config
+            pass_ctx = tilelang.transform.get_pass_context()
+            use_scattered = bool(
+                pass_ctx and pass_ctx.config.get(
+                    PassConfigKey.TL_SCATTERED_WARP_LAYOUT, False))
+
+            if use_scattered:
+                # HipKittens-style scattered warp layout:
+                # Split M and N into 2 halves each, iterate over 4 quadrants.
+                # Each quadrant uses half the warp_rows and warp_cols.
+                m_subtiles = 2
+                n_subtiles = 2
+                sub_warp_rows = warp_rows // m_subtiles
+                sub_warp_cols = warp_cols // n_subtiles
+
+                @T.prim_func
+                def _gemm_ssr_scattered() -> None:
+                    # Half-sized local buffers (only need to hold one quadrant's data)
+                    A_local = T.alloc_local((sub_warp_rows * local_size_a * self.k_pack), in_dtype)
+                    B_local = T.alloc_local((sub_warp_cols * local_size_b * self.k_pack), in_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
+                    for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
+                        for sub_m, sub_n in T.grid(m_subtiles, n_subtiles):
+                            # S2R A: load sub_warp_rows from A_shared[sub_m * half_M :]
+                            mfma_emitter.ldmatrix_a(
+                                A_local, A_region, ki,
+                                num_rows=sub_warp_rows,
+                                row_offset=sub_m * sub_warp_rows,
+                            )
+                            # S2R B: load sub_warp_cols from B_shared[sub_n * half_N :]
+                            mfma_emitter.ldmatrix_b(
+                                B_local, B_region, ki,
+                                num_cols=sub_warp_cols,
+                                col_offset=sub_n * sub_warp_cols,
+                            )
+                            # MFMA: compute sub-block, write to correct C_local position
+                            mfma_emitter.mfma(
+                                A_local, B_local, C_buf, ki,
+                                num_rows=sub_warp_rows,
+                                num_cols=sub_warp_cols,
+                                c_row_offset=sub_m * sub_warp_rows,
+                                c_col_offset=sub_n * sub_warp_cols,
+                            )
+
+                return _Simplify(_gemm_ssr_scattered, inline_let=True)
 
             @T.prim_func
             def _gemm_ssr() -> None:
