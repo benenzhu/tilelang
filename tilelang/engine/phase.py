@@ -318,8 +318,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
 
     # Interleave G2S with MFMA compute (HipKittens-style)
     if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
-        mod = tilelang.transform.InterleaveG2SWithCompute()(mod)
-        print_pass(mod, "InterleaveG2SWithCompute")
+        mod = tilelang.transform.InjectCdna4Pipeline()(mod)
+        print_pass(mod, "InjectCdna4Pipeline")
 
     mod = tir.transform.NarrowDataType(32)(mod)
     print_pass(mod, "NarrowDataType")
@@ -419,6 +419,11 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # as ptx async copy won't be recognized as a valid buffer load
     mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
     print_pass(mod, "InjectPTXAsyncCopy")
+    # Remove spurious tvm_storage_sync inserted by ThreadSync when
+    # InjectCdna4Pipeline already handles synchronization with vmcnt + s_barrier
+    #if _is_hip_target(target) and _should_interleave_g2s(pass_ctx):
+    #    mod = tilelang.transform.RemoveRedundantSync()(mod)
+    #    print_pass(mod, "RemoveRedundantSync")
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
         print_pass(mod, "AnnotateWarpGroupRegAlloc")

@@ -11,6 +11,7 @@ from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
 from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
 from .interleave_g2s import InterleaveG2SWithCompute  # noqa: F401
 from .inject_cdna4_pipeline import InjectCdna4Pipeline  # noqa: F401
+from .remove_redundant_sync import RemoveRedundantSync  # noqa: F401
 
 
 def get_pass_context():

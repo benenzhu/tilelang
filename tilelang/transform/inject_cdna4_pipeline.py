@@ -1,25 +1,22 @@
-"""CDNA4 (gfx950) optimized pipeline: 2-step-ahead G2S with vmcnt(6).
+"""CDNA4 (gfx950) optimized pipeline: interleaved G2S with direct vmcnt.
 
 Runs AFTER InjectSoftwarePipeline + LowerOpaqueBlock + Simplify.
 Transforms the standard pipeline (all G2S → wait → compute) into
-a HipKittens-style interleaved schedule:
+a HipKittens-style interleaved schedule where G2S loads are distributed
+across MFMA compute phases.
 
-  Phase 0: S2R + G2S(As[(k+1)&1][1], completing k+1) + MFMA
-  Phase 1: S2R + G2S(As[k&1][0], starting k+2)       + MFMA
-  Phase 2: S2R + G2S(Bs[k&1][0], k+2)                 + MFMA
-  Phase 3: S2R + G2S(Bs[k&1][1], k+2) + vmcnt(6)      + MFMA
+Uses direct `tl_waitcnt_vmcnt(N)` and `s_barrier` calls, completely
+bypassing InjectPTXAsyncCopy's commit-group vmcnt mapping.
 
-Uses direct `tl_waitcnt_vmcnt(N)` calls, bypassing InjectPTXAsyncCopy's
-commit-group vmcnt mapping.
+G2S stores are emitted as raw async_scope stores (no async_commit_queue_scope),
+so InjectPTXAsyncCopy won't insert spurious __syncthreads between them.
 """
 
 from __future__ import annotations
 
 from tvm import tir
 from tvm.tir import (
-    Allocate,
     AttrStmt,
-    DeclBuffer,
     Evaluate,
     For,
     ForKind,
@@ -35,11 +32,9 @@ from tvm.tir.transform import prim_func_pass
 from .interleave_g2s import (
     _flatten_seq,
     _is_sched_barrier,
-    _is_setprio,
     _find_async_blocks,
     _find_consumer,
     _extract_consumer_stages,
-    _make_async_g2s,
     _rewrap,
 )
 
@@ -51,12 +46,35 @@ def _make_vmcnt(n: int) -> Stmt:
     )
 
 
+def _make_s_barrier() -> Stmt:
+    """Emit __builtin_amdgcn_s_barrier() for workgroup sync."""
+    return Evaluate(
+        tir.call_extern("int32", "__builtin_amdgcn_s_barrier")
+    )
+
+
+def _make_raw_g2s(inner_store_loop: Stmt) -> Stmt:
+    """Wrap a G2S store in async_scope only (NO async_commit_queue_scope).
+
+    This ensures InjectPTXAsyncCopy will convert it to ptx_cp_async
+    but won't insert tvm_storage_sync between adjacent stores.
+    """
+    return AttrStmt(
+        IntImm("int32", 0), "async_scope", IntImm("int32", 1),
+        inner_store_loop,
+    )
+
+
 def _interleave_one_stage(
     stage_stmts: list[Stmt],
     g2s_stores: list[Stmt],
     vmcnt_value: int | None = None,
+    barrier_after: bool = False,
 ) -> list[Stmt]:
-    """Insert G2S loads into one MFMA stage, with optional vmcnt before MFMA."""
+    """Insert G2S loads into one MFMA stage, with optional vmcnt before MFMA.
+
+    G2S stores are wrapped in async_scope only (not async_commit_queue_scope).
+    """
     sched_barrier_count = 0
     insert_idx = None
 
@@ -71,16 +89,19 @@ def _interleave_one_stage(
         return stage_stmts
 
     result = []
-    # S2R loads
+    # S2R loads (sched_barrier + ds_reads)
     result.extend(stage_stmts[:insert_idx])
-    # G2S loads
+    # G2S loads (raw async_scope, no commit)
     for g in g2s_stores:
-        result.append(_make_async_g2s(g))
+        result.append(_make_raw_g2s(g))
     # Second sched_barrier
     result.append(stage_stmts[insert_idx])
     # vmcnt before MFMA if specified
     if vmcnt_value is not None:
         result.append(_make_vmcnt(vmcnt_value))
+    # s_barrier after vmcnt if requested (ensures all threads' G2S are visible)
+    if barrier_after:
+        result.append(_make_s_barrier())
     # MFMA block (setprio + MFMAs + setprio)
     result.extend(stage_stmts[insert_idx + 1:])
 
@@ -88,7 +109,12 @@ def _interleave_one_stage(
 
 
 def _try_cdna4_pipeline(loop: For) -> Stmt | None:
-    """Transform pipeline loop into CDNA4 2-step-ahead schedule."""
+    """Transform pipeline loop into CDNA4 interleaved schedule.
+
+    1-step-ahead: G2S loads for k+1 are distributed across 4 MFMA stages
+    of the current k iteration. vmcnt(0) + s_barrier at the last stage
+    ensures all G2S complete before next iteration reads shared memory.
+    """
     body_stmts = _flatten_seq(loop.body)
     k = loop.loop_var
 
@@ -106,76 +132,55 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
         return None
     mfma_stages, alloc_wrappers = result
 
-    if len(mfma_stages) != 4 or len(g2s_a) != 4 or len(g2s_b) != 4:
+    if len(mfma_stages) != 4:
         return None
 
-    one = IntImm(k.dtype, 1)
+    total_g2s = g2s_a + g2s_b
+    num_g2s = len(total_g2s)
+    if num_g2s == 0:
+        return None
+
     orig_n = int(loop.extent) if isinstance(loop.extent, IntImm) else None
-    if orig_n is None or orig_n < 3:
+    if orig_n is None or orig_n < 2:
         return None
 
-    # 2. Build 2-step-ahead interleaved body
-    # Phase 0: G2S A[2,3] for k+1 (completion), Phase 1-3: G2S for k+2
+    # 2. Distribute G2S across 4 stages evenly
+    # With 8 G2S and 4 stages: 2 per stage
+    g2s_per_stage = (num_g2s + 3) // 4
+
     phase_stmts = []
-    phase_stmts.extend(_interleave_one_stage(
-        mfma_stages[0], [g2s_a[2], g2s_a[3]],
-    ))
-    phase_stmts.extend(_interleave_one_stage(
-        mfma_stages[1],
-        [substitute(g2s_a[0], {k: k + one}), substitute(g2s_a[1], {k: k + one})],
-    ))
-    phase_stmts.extend(_interleave_one_stage(
-        mfma_stages[2],
-        [substitute(g2s_b[0], {k: k + one}), substitute(g2s_b[1], {k: k + one})],
-    ))
-    phase_stmts.extend(_interleave_one_stage(
-        mfma_stages[3],
-        [substitute(g2s_b[2], {k: k + one}), substitute(g2s_b[3], {k: k + one})],
-        vmcnt_value=6,
-    ))
+    for i, stage in enumerate(mfma_stages):
+        g_start = i * g2s_per_stage
+        g_end = min(g_start + g2s_per_stage, num_g2s)
+        g2s_slice = total_g2s[g_start:g_end]
+
+        is_last = (i == len(mfma_stages) - 1)
+        phase_stmts.extend(_interleave_one_stage(
+            stage,
+            g2s_slice,
+            vmcnt_value=0 if is_last else None,
+            barrier_after=is_last,
+        ))
 
     interleaved = SeqStmt(phase_stmts)
     if alloc_wrappers:
         interleaved = _rewrap(interleaved, alloc_wrappers)
 
-    # 3. Main loop: k=0..N-3 (avoid k+2 OOB)
+    # 3. Build the loop (same range as original)
     main_loop = For(
-        k, loop.min, IntImm(loop.extent.dtype, orig_n - 1),
+        k, loop.min, loop.extent,
         loop.kind, interleaved, loop.thread_binding, loop.annotations,
     )
 
-    # 4. Last iter (k=N-2): standard 8 G2S for k+1, vmcnt(0)
-    last_k = IntImm(k.dtype, orig_n - 2)
-    all_g2s = g2s_a + g2s_b
-    last_stmts = []
-    for i, stage in enumerate(mfma_stages):
-        g_start = i * 2
-        g_end = g_start + 2
-        last_stmts.extend(_interleave_one_stage(
-            [substitute(s, {k: last_k}) for s in stage],
-            [substitute(s, {k: last_k}) for s in all_g2s[g_start:g_end]],
-            vmcnt_value=0 if i == 3 else None,
-        ))
-    last_body = SeqStmt(last_stmts)
-    if alloc_wrappers:
-        last_body = _rewrap(last_body, alloc_wrappers)
+    # 4. Prologue: vmcnt(0) + s_barrier to drain initial G2S before entering loop
+    prologue = SeqStmt([_make_vmcnt(0), _make_s_barrier()])
 
-    # 5. Extra prologue: 6 G2S for k=1 (A[0,1] + B[0..3])
-    k0 = IntImm(k.dtype, 0)
-    extra = [substitute(s, {k: k0}) for s in [
-        g2s_a[0], g2s_a[1], g2s_b[0], g2s_b[1], g2s_b[2], g2s_b[3],
-    ]]
-    extra_prologue = SeqStmt([_make_async_g2s(s) for s in extra])
-
-    # 6. Prologue wait
-    prologue_wait = _make_vmcnt(0)
-
-    return SeqStmt([extra_prologue, prologue_wait, main_loop, last_body])
+    return SeqStmt([prologue, main_loop])
 
 
 @tir.functor.mutator
 class InjectCdna4PipelineMutator(tir.PyStmtExprMutator):
-    """Find the pipeline k-loop and apply CDNA4 2-step-ahead schedule."""
+    """Find the pipeline k-loop and apply CDNA4 interleaved schedule."""
 
     def __init__(self):
         super().__init__()
@@ -186,7 +191,7 @@ class InjectCdna4PipelineMutator(tir.PyStmtExprMutator):
             not self._found
             and op.kind == ForKind.SERIAL
             and isinstance(op.extent, IntImm)
-            and int(op.extent) > 2
+            and int(op.extent) > 1
         ):
             body_stmts = _flatten_seq(op.body)
             has_async = any(
@@ -210,7 +215,7 @@ class InjectCdna4PipelineMutator(tir.PyStmtExprMutator):
 
 
 def InjectCdna4Pipeline():
-    """TVM Pass: CDNA4 optimized pipeline with 2-step-ahead G2S prefetch."""
+    """TVM Pass: CDNA4 optimized pipeline with interleaved G2S and direct vmcnt."""
 
     def pass_fn(func: PrimFunc, mod, ctx) -> PrimFunc:
         mutator = InjectCdna4PipelineMutator()

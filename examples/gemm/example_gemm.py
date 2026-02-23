@@ -1,7 +1,8 @@
-import tilelang
-import tilelang.language as T
 import os
 os.system("rm *.s")
+os.system('find ~/.tilelang/ -name "*.so" -print -delete')
+import tilelang
+import tilelang.language as T
 
 
 # @tilelang.jit(out_idx=[-1], debug_root_path="./debug_output", pass_configs={
