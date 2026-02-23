@@ -54,11 +54,7 @@ def _make_s_barrier() -> Stmt:
 
 
 def _make_raw_g2s(inner_store_loop: Stmt) -> Stmt:
-    """Wrap a G2S store in async_scope only (NO async_commit_queue_scope).
-
-    This ensures InjectPTXAsyncCopy will convert it to ptx_cp_async
-    but won't insert tvm_storage_sync between adjacent stores.
-    """
+    """Wrap a G2S store in async_scope only (NO async_commit_queue_scope)."""
     return AttrStmt(
         IntImm("int32", 0), "async_scope", IntImm("int32", 1),
         inner_store_loop,
@@ -71,10 +67,7 @@ def _interleave_one_stage(
     vmcnt_value: int | None = None,
     barrier_after: bool = False,
 ) -> list[Stmt]:
-    """Insert G2S loads into one MFMA stage, with optional vmcnt before MFMA.
-
-    G2S stores are wrapped in async_scope only (not async_commit_queue_scope).
-    """
+    """Insert G2S loads into one MFMA stage, with optional vmcnt before MFMA."""
     sched_barrier_count = 0
     insert_idx = None
 
@@ -89,31 +82,27 @@ def _interleave_one_stage(
         return stage_stmts
 
     result = []
-    # S2R loads (sched_barrier + ds_reads)
     result.extend(stage_stmts[:insert_idx])
-    # G2S loads (raw async_scope, no commit)
     for g in g2s_stores:
         result.append(_make_raw_g2s(g))
-    # Second sched_barrier
     result.append(stage_stmts[insert_idx])
-    # vmcnt before MFMA if specified
     if vmcnt_value is not None:
         result.append(_make_vmcnt(vmcnt_value))
-    # s_barrier after vmcnt if requested (ensures all threads' G2S are visible)
     if barrier_after:
         result.append(_make_s_barrier())
-    # MFMA block (setprio + MFMAs + setprio)
     result.extend(stage_stmts[insert_idx + 1:])
 
     return result
 
 
 def _try_cdna4_pipeline(loop: For) -> Stmt | None:
-    """Transform pipeline loop into CDNA4 interleaved schedule.
+    """Transform pipeline loop body into interleaved stages.
 
-    1-step-ahead: G2S loads for k+1 are distributed across 4 MFMA stages
-    of the current k iteration. vmcnt(0) + s_barrier at the last stage
-    ensures all G2S complete before next iteration reads shared memory.
+    Returns the new loop body (For node) with G2S distributed across
+    MFMA stages, or None if the loop doesn't match.
+
+    The caller (_transform_pipeline_seq) handles removing the original G2S
+    and replacing the async_wait synchronization.
     """
     body_stmts = _flatten_seq(loop.body)
     k = loop.loop_var
@@ -144,9 +133,7 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
     if orig_n is None or orig_n < 2:
         return None
 
-    # 2. Build stages — stage-reorder only (no G2S interleaving)
-    # Keep original G2S + async_wait, just replace consumer with reordered stages
-    # 2. Build interleaved stages with G2S distributed across them
+    # 2. Build interleaved stages with G2S distributed
     g2s_per_stage = (num_g2s + 3) // 4
 
     phase_stmts = []
@@ -163,67 +150,100 @@ def _try_cdna4_pipeline(loop: For) -> Stmt | None:
             barrier_after=is_last,
         ))
 
-    reordered_consumer = SeqStmt(phase_stmts)
+    interleaved = SeqStmt(phase_stmts)
     if alloc_wrappers:
-        reordered_consumer = _rewrap(reordered_consumer, alloc_wrappers)
+        interleaved = _rewrap(interleaved, alloc_wrappers)
 
-    # 3. Keep original G2S blocks and async_wait, replace only the consumer body.
-    # This preserves the async_wait(inflight=1) → cp_async_wait<N> synchronization
-    # that ensures the PREVIOUS k's G2S is complete before S2R reads shared memory.
-    # The new G2S stores (interleaved into stages) will be for the NEXT k+1,
-    # so they coexist with the original G2S which loads k+1 via the standard pipeline.
-    new_body_stmts = []
-    for stmt in body_stmts:
-        if isinstance(stmt, AttrStmt) and stmt.attr_key in ("async_scope", "async_commit_queue_scope"):
-            new_body_stmts.append(stmt)  # keep original G2S
-        elif isinstance(stmt, AttrStmt) and stmt.attr_key == "async_wait_queue_scope":
-            # Replace consumer inside async_wait with interleaved version
-            wait_body = stmt.body
-            if isinstance(wait_body, AttrStmt) and wait_body.attr_key == "async_wait_inflight_count":
-                wrapped = AttrStmt(
-                    wait_body.node, wait_body.attr_key, wait_body.value,
-                    reordered_consumer,
-                )
-                new_body_stmts.append(AttrStmt(
-                    stmt.node, stmt.attr_key, stmt.value, wrapped,
-                ))
-            else:
-                new_body_stmts.append(stmt)
-
-    new_body = SeqStmt(new_body_stmts) if len(new_body_stmts) > 1 else new_body_stmts[0]
+    # 3. New loop body: just the interleaved stages (no original G2S, no async_wait)
     return For(
         k, loop.min, loop.extent,
-        loop.kind, new_body, loop.thread_binding, loop.annotations,
+        loop.kind, interleaved, loop.thread_binding, loop.annotations,
     )
+
+
+def _is_pipeline_loop(stmt: Stmt) -> bool:
+    """Check if a For looks like a pipeline loop (serial, extent>1, has async)."""
+    if not isinstance(stmt, For) or stmt.kind != ForKind.SERIAL:
+        return False
+    if not isinstance(stmt.extent, IntImm) or int(stmt.extent) <= 1:
+        return False
+    body_stmts = _flatten_seq(stmt.body)
+    return any(
+        isinstance(s, AttrStmt)
+        and s.attr_key in ("async_scope", "async_commit_queue_scope")
+        for s in body_stmts
+    )
+
+
+def _transform_pipeline_seq(stmts: list[Stmt]):
+    """Transform a sequence containing [prologue_g2s..., k_loop, epilogue].
+
+    Finds the pipeline k-loop, applies interleaving, and removes original G2S
+    from the loop body while keeping prologue G2S + adding vmcnt(0)+s_barrier.
+
+    Returns transformed list of statements, or None if no transformation was done.
+    """
+    # Find the pipeline k-loop index
+    loop_idx = None
+    for i, s in enumerate(stmts):
+        if _is_pipeline_loop(s):
+            loop_idx = i
+            break
+
+    if loop_idx is None:
+        return None
+
+    loop = stmts[loop_idx]
+    new_loop = _try_cdna4_pipeline(loop)
+    if new_loop is None:
+        return None
+
+    # Build the new statement sequence:
+    # 1. Keep everything before the loop (prologue G2S, etc.)
+    # 2. Add vmcnt(0) + s_barrier to wait for prologue G2S
+    # 3. The transformed loop (with interleaved G2S, no original G2S)
+    # 4. Keep everything after the loop (epilogue)
+    result = []
+    result.extend(stmts[:loop_idx])       # prologue G2S blocks
+    result.append(_make_vmcnt(0))          # wait for prologue G2S
+    result.append(_make_s_barrier())       # workgroup sync
+    result.append(new_loop)                # interleaved loop
+    result.extend(stmts[loop_idx + 1:])   # epilogue
+    return result
 
 
 @tir.functor.mutator
 class InjectCdna4PipelineMutator(tir.PyStmtExprMutator):
-    """Find the pipeline k-loop and apply CDNA4 interleaved schedule."""
+    """Find the pipeline sequence and apply CDNA4 interleaved schedule.
+
+    Works at the SeqStmt level to transform the entire pipeline sequence
+    (prologue G2S + k-loop + epilogue) together, enabling removal of
+    duplicate G2S stores.
+    """
 
     def __init__(self):
         super().__init__()
         self._found = False
 
-    def visit_for_(self, op: For) -> Stmt:
-        if (
-            not self._found
-            and op.kind == ForKind.SERIAL
-            and isinstance(op.extent, IntImm)
-            and int(op.extent) > 1
-        ):
-            body_stmts = _flatten_seq(op.body)
-            has_async = any(
-                isinstance(s, AttrStmt)
-                and s.attr_key in ("async_scope", "async_commit_queue_scope")
-                for s in body_stmts
-            )
-            if has_async:
-                result = _try_cdna4_pipeline(op)
+    def visit_seq_stmt_(self, op: SeqStmt) -> Stmt:
+        if not self._found:
+            stmts = list(op)
+            # Check if this SeqStmt contains a pipeline loop
+            has_loop = any(_is_pipeline_loop(s) for s in stmts)
+            if has_loop:
+                result = _transform_pipeline_seq(stmts)
                 if result is not None:
                     self._found = True
-                    return result
+                    return SeqStmt(result) if len(result) > 1 else result[0]
 
+        # Default: recurse into children
+        new_stmts = [self.visit_stmt(s) for s in op]
+        if all(n.same_as(o) for n, o in zip(new_stmts, op)):
+            return op
+        return SeqStmt(new_stmts)
+
+    def visit_for_(self, op: For) -> Stmt:
+        # Still need to recurse into For nodes to find nested SeqStmts
         new_body = self.visit_stmt(op.body)
         if new_body.same_as(op.body):
             return op
