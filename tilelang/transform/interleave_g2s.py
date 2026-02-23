@@ -313,6 +313,164 @@ def _is_s2r_loop(node: For) -> bool:
     return False
 
 
+def _try_eval_int(expr) -> int | None:
+    """Try to evaluate a constant TIR expression to a Python int.
+
+    After loop unrolling with substitute(), expressions like T.Mul(3, 16) + T.Mul(1, 8)
+    are constant but not yet simplified by TVM. This evaluates them in Python.
+    """
+    if isinstance(expr, IntImm):
+        return int(expr.value)
+    if isinstance(expr, tir.Add):
+        a, b = _try_eval_int(expr.a), _try_eval_int(expr.b)
+        if a is not None and b is not None:
+            return a + b
+    if isinstance(expr, tir.Mul):
+        a, b = _try_eval_int(expr.a), _try_eval_int(expr.b)
+        if a is not None and b is not None:
+            return a * b
+    if isinstance(expr, tir.Sub):
+        a, b = _try_eval_int(expr.a), _try_eval_int(expr.b)
+        if a is not None and b is not None:
+            return a - b
+    if isinstance(expr, tir.FloorDiv):
+        a, b = _try_eval_int(expr.a), _try_eval_int(expr.b)
+        if a is not None and b is not None and b != 0:
+            return a // b
+    if isinstance(expr, tir.FloorMod):
+        a, b = _try_eval_int(expr.a), _try_eval_int(expr.b)
+        if a is not None and b is not None and b != 0:
+            return a % b
+    return None
+
+
+def _buf_key(data_var) -> str:
+    """Get a stable key for a buffer data variable.
+
+    After TVM substitute(), the same logical buffer may have different Python
+    object ids. We use the Var's name_hint as a stable identifier instead.
+    """
+    if hasattr(data_var, 'name_hint'):
+        return data_var.name_hint
+    if hasattr(data_var, 'name'):
+        return data_var.name
+    return str(data_var)
+
+
+def _extract_s2r_vec_index(stmt: Stmt):
+    """Extract (buf_key, vec_index) from an unrolled S2R vectorized store.
+
+    An unrolled S2R statement looks like:
+        For(vec, 0, 8, VECTORIZED, BufferStore(A_local, [base + vec], ...))
+
+    Returns (buf_key, base // vec_lanes) or None.
+    """
+    if not isinstance(stmt, For) or stmt.kind != ForKind.VECTORIZED:
+        return None
+    body = stmt.body
+    if not isinstance(body, BufferStore):
+        return None
+    if body.buffer.scope() != "local":
+        return None
+
+    # Substitute vec_var=0 to isolate the base element offset
+    idx = body.indices[0]
+    base_expr = substitute(idx, {stmt.loop_var: IntImm(stmt.loop_var.dtype, 0)})
+    base_val = _try_eval_int(base_expr)
+    if base_val is None:
+        return None
+
+    vec_lanes = int(stmt.extent)
+    vec_index = base_val // vec_lanes
+    return (_buf_key(body.buffer.data), vec_index)
+
+
+def _extract_mfma_operands(stmt: Stmt):
+    """Extract MFMA operand register indices.
+
+    tvm_mfma(shape, la, lb, da, db, dc, B.data, b_idx, A.data, a_idx, C.data, c_idx)
+                                        args[6] [7]    [8]     [9]
+
+    Returns (id(A.data), a_idx, id(B.data), b_idx) or None.
+    """
+    if not isinstance(stmt, Evaluate):
+        return None
+    call = stmt.value
+    if not isinstance(call, tir.Call):
+        return None
+    if not hasattr(call.op, 'name'):
+        return None
+
+    op_name = call.op.name
+    is_mfma = "mfma" in op_name
+    if not is_mfma and op_name == "tir.call_extern":
+        if len(call.args) > 0 and isinstance(call.args[0], tir.StringImm):
+            is_mfma = "mfma" in call.args[0].value
+    if not is_mfma:
+        return None
+
+    args = call.args
+    if len(args) < 12:
+        return None
+
+    b_data = args[6]
+    b_idx = _try_eval_int(args[7])
+    a_data = args[8]
+    a_idx = _try_eval_int(args[9])
+
+    if b_idx is None or a_idx is None:
+        return None
+
+    return (_buf_key(a_data), a_idx, _buf_key(b_data), b_idx)
+
+
+def _verify_stage_dependencies(stages: list[list[Stmt]]) -> None:
+    """Verify MFMA data dependencies across interleaved stages.
+
+    Checks that every MFMA instruction only reads A_local/B_local vector indices
+    that have been loaded by an S2R instruction in the same or an earlier stage.
+
+    This catches errors in the kp/j-half splitting logic that would otherwise
+    produce silent wrong results.
+
+    Raises ValueError with diagnostics if a violation is found.
+    """
+    loaded = set()  # (buffer_data_id, vec_index) pairs loaded so far
+
+    for stage_idx, stage_stmts in enumerate(stages):
+        # First: collect all S2R loads in this stage
+        for stmt in stage_stmts:
+            info = _extract_s2r_vec_index(stmt)
+            if info is not None:
+                loaded.add(info)
+
+        # Then: verify all MFMAs in this stage use already-loaded data
+        for stmt in stage_stmts:
+            operands = _extract_mfma_operands(stmt)
+            if operands is None:
+                continue
+            a_buf, a_idx, b_buf, b_idx = operands
+
+            a_key = (a_buf, a_idx)
+            b_key = (b_buf, b_idx)
+
+            if a_key not in loaded:
+                a_loaded = sorted(vi for bk, vi in loaded if bk == a_buf)
+                raise ValueError(
+                    f"Stage {stage_idx}: MFMA reads {a_buf} vec[{a_idx}] "
+                    f"but it was not loaded by any S2R in stages 0..{stage_idx}. "
+                    f"Loaded {a_buf} vec indices so far: {a_loaded}"
+                )
+
+            if b_key not in loaded:
+                b_loaded = sorted(vi for bk, vi in loaded if bk == b_buf)
+                raise ValueError(
+                    f"Stage {stage_idx}: MFMA reads {b_buf} vec[{b_idx}] "
+                    f"but it was not loaded by any S2R in stages 0..{stage_idx}. "
+                    f"Loaded {b_buf} vec indices so far: {b_loaded}"
+                )
+
+
 def _create_stages_from_raw_consumer(consumer_body: Stmt):
     """Create 4 MFMA stages from raw consumer body without sched_barrier markers.
 
@@ -419,6 +577,10 @@ def _create_stages_from_raw_consumer(consumer_body: Stmt):
         _build_stage(b_kp1_hi, mfma_kp1_hi),              # Stage 3
     ]
 
+    # Verify data dependencies: every MFMA must only use register data
+    # that was loaded by an S2R in the same or earlier stage.
+    _verify_stage_dependencies(stages)
+
     return stages, wrappers
 
 
@@ -464,19 +626,7 @@ def _extract_consumer_stages(consumer_body: Stmt):
         return stages, wrappers
 
     # Fallback: no sched_barrier stages, auto-create from raw S2R + MFMA loops
-    result = _create_stages_from_raw_consumer(consumer_body)
-    if result is None:
-        print(f"[InterleaveG2S] _create_stages_from_raw_consumer failed")
-        # Debug: show what we found
-        inner_dbg, wrappers_dbg = _unwrap_alloc_decl(consumer_body)
-        stmts_dbg = _flatten_seq(inner_dbg)
-        print(f"[InterleaveG2S]   inner type: {type(inner_dbg).__name__}, wrappers: {len(wrappers_dbg)}")
-        print(f"[InterleaveG2S]   flattened stmts: {len(stmts_dbg)}")
-        for i, s in enumerate(stmts_dbg):
-            print(f"[InterleaveG2S]   stmt[{i}]: {type(s).__name__}, kind={getattr(s, 'kind', 'N/A')}")
-            if isinstance(s, For):
-                print(f"[InterleaveG2S]     extent={s.extent}, is_s2r={_is_s2r_loop(s)}, has_mfma={_contains_mfma(s)}")
-    return result
+    return _create_stages_from_raw_consumer(consumer_body)
 
 
 # ---------------------------------------------------------------------------
@@ -589,26 +739,17 @@ def _try_interleave_loop_body(loop: For) -> Stmt | None:
     # 1. Find G2S async blocks
     g2s_a, g2s_b, remaining = _find_async_blocks(body_stmts)
     if g2s_a is None or g2s_b is None:
-        print(f"[InterleaveG2S] G2S blocks not found: g2s_a={g2s_a is not None}, g2s_b={g2s_b is not None}")
         return None
-
-    print(f"[InterleaveG2S] Found G2S: A={len(g2s_a)}, B={len(g2s_b)}, remaining={len(remaining)}")
 
     # 2. Find consumer block
     consumer_body, _found = _find_consumer(remaining)
     if consumer_body is None:
-        print("[InterleaveG2S] Consumer not found")
         return None
-
-    print(f"[InterleaveG2S] Consumer found, type={type(consumer_body).__name__}")
 
     # 3. Extract MFMA stages
     result = _extract_consumer_stages(consumer_body)
     if result is None:
-        print("[InterleaveG2S] Failed to extract MFMA stages")
         return None
-
-    print(f"[InterleaveG2S] Got {len(result[0])} stages")
     mfma_stages, alloc_wrappers = result
     if len(mfma_stages) == 0:
         return None
