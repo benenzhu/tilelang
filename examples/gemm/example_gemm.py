@@ -69,8 +69,8 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
 ### TODO(zty): 1. add a new kernel for NT layout? or just transpose B and continues can do?
 
 def main(transpose_b=False):
-    # M, N, K = 8192, 8192, 8192
-    M, N, K = 256, 256, 1024
+    M, N, K = 8192, 8192, 8192
+    # M, N, K = 256, 256, 1024
     if not transpose_b:
         assert False, "not implemented"
         kernel = matmul(M, N, K, 128, 128, 32)

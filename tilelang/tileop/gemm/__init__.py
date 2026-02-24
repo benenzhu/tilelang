@@ -19,8 +19,8 @@ from tilelang.jit.adapter.utils import is_cutedsl_target
 
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
 def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range):
-    thread_nums = thread_bounds.extent
-    return gemm_py.infer_layout(target, thread_nums)
+    thread_nums = thread_bounds.extent # 512
+    return gemm_py.infer_layout(target, thread_nums) # target: hip,  max_num_threads 不对， max_shared_memory_per_block 不对 
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.lower")
@@ -113,8 +113,8 @@ class GemmPy(Node, Scriptable):
 
     def infer_layout(self, target: Target, thread_nums: int):
         """Infer the layout for the GEMM operation based on target architecture."""
-        gemm_inst = self._select_gemm_instruction(thread_nums, target)
-        impl_class = self._get_implementation_class(gemm_inst, target)
+        gemm_inst = self._select_gemm_instruction(thread_nums, target) # GemmInst.MFMA
+        impl_class = self._get_implementation_class(gemm_inst, target) # GemmMFMA
         return impl_class(self).infer_layout(target, thread_nums)
 
     def lower(self, layout_map: dict, target: Target, thread_bounds: Range, thread_var: tir.Var):

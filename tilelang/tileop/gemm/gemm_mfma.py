@@ -43,8 +43,9 @@ def _get_mfma_k_dim(target: Target, in_dtype: str) -> int | None:
 class GemmMFMA(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MFMA)
-        warp_row_tiles = int(self.M // m_warp)
-        warp_col_tiles = int(self.N // n_warp)
+        print(f"m_warp: {m_warp}, n_warp: {n_warp}")
+        warp_row_tiles = int(self.M // m_warp) # m_warp: 4, n_warp: 2 # 64
+        warp_col_tiles = int(self.N // n_warp) # 128
         mfma_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
             b_dtype=self.in_dtype,

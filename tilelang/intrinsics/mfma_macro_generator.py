@@ -81,18 +81,18 @@ class MatrixCoreIntrinEmitter:
         thread_var: Var | None = None,
         mfma_k_dim: int | None = None,
     ):
-        self.a_dtype = a_dtype
-        self.b_dtype = b_dtype
-        self.accum_dtype = accum_dtype
-        self.a_transposed = a_transposed
-        self.b_transposed = b_transposed
+        self.a_dtype = a_dtype # bf16
+        self.b_dtype = b_dtype # bf16
+        self.accum_dtype = accum_dtype # Float32
+        self.a_transposed = a_transposed # False
+        self.b_transposed = b_transposed # True
         # Hint Information
-        self.block_row_warps = block_row_warps
-        self.block_col_warps = block_col_warps
-        self.warp_row_tiles = warp_row_tiles
-        self.warp_col_tiles = warp_col_tiles
-        self.chunk = chunk
-        self._initialize_k_dim(a_dtype, mfma_k_dim)
+        self.block_row_warps = block_row_warps # 4
+        self.block_col_warps = block_col_warps # 2
+        self.warp_row_tiles = warp_row_tiles # 64
+        self.warp_col_tiles = warp_col_tiles # 128
+        self.chunk = chunk # 64 就是 block_K 的意思
+        self._initialize_k_dim(a_dtype, mfma_k_dim) # 32
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
         self._initialize_mfma_prefix(self.k_dim)
@@ -127,7 +127,7 @@ class MatrixCoreIntrinEmitter:
             raise ValueError(f"Unsupported a_dtype = {a_dtype}")
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16, warp_size=32):
-        self.local_size_a = (m_dim * k_dim) // warp_size
+        self.local_size_a = (m_dim * k_dim) // warp_size # local_size 表示的是每个 lane（线程）在一次 MFMA 指令中需要持有的元素个数。 决定了 T.alloc_local 分配出来 reg 的大小
         self.local_size_b = (n_dim * k_dim) // warp_size
         self.local_size_out = (m_dim * n_dim) // warp_size
 

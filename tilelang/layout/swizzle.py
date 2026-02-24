@@ -60,14 +60,14 @@ def _get_element_size(buffer_or_load_or_region: Buffer | BufferLoad | BufferRegi
 # Use a stable swizzled layout to ensure consistent memory access patterns.
 # Swizzling should be enabled or disabled based on whether TMA (Tensor Memory Access) is applied.
 def make_swizzled_layout(buffer: Buffer | BufferLoad | BufferRegion, k_major: bool = True, allow_pad: bool = True):
-    stride, continuous = _get_stride_continuous(buffer)
-    element_size = _get_element_size(buffer)
+    stride, continuous = _get_stride_continuous(buffer) # stride: 256, continuous: 64
+    element_size = _get_element_size(buffer) # 16 bits
     return _ffi_api.make_swizzled_layout(
-        stride,
-        continuous,
-        element_size,
-        k_major,
-        allow_pad,
+        stride, # 256
+        continuous, # 64
+        element_size, # 16
+        k_major, # True
+        allow_pad, # True
     )
 
 
