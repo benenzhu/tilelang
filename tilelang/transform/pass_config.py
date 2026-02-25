@@ -121,6 +121,11 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 
+    TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
+    """Allow loop unswitching even when the else-version of the loop body has side effects.
+
+    This is more aggressive and may increase code size. Default: False.
+    """
     TL_INTERLEAVE_G2S = "tl.interleave_g2s"
     """Interleave G2S (Global-to-Shared) loads with MFMA compute stages.
     When enabled, distributes G2S loads across MFMA phases instead of
