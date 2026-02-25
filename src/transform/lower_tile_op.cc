@@ -878,14 +878,33 @@ private:
     }
     return load;
   }
-
+  #define L(x) ", " #x ": " << x
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto buffer = store->buffer;
-    if (buffer_remap_.count(buffer)) {
+    // LOG(INFO) << L(store);
+    // LOG(INFO) << "store->buffer: " << store->buffer << " " << "count: " << buffer_remap_.count(buffer);
+    if (buffer_remap_.count(buffer)) { // pass 遍历的时候，如果这个buffer需要做 swizzle 的话
       auto new_indices = layout_map_[buffer]->Forward(store->indices);
       auto new_buffer = buffer_remap_[store->buffer];
       layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
+      // new added function.
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)){
+        LOG(INFO) << L(store);
+        LOG(INFO) << L(store->buffer);
+        LOG(INFO) << L(store->value);
+        LOG(INFO) << L(store->indices);
+        LOG(INFO) << L(store->predicate);
+        LOG(INFO) << L(store->span);
+        LOG(INFO) << L(new_indices);
+        const BufferLoadNode *load_node = nullptr; 
+        PrimExpr store_value = store->value;
+        if (auto *load = store_value.as<BufferLoadNode>()) {
+          if (IsGlobalBuffer(load->buffer)) {
+            load_node = load;
+          }
+        }
+      }
       return BufferStore(new_buffer, store->value, new_indices);
     } else if (var_remap_.count(buffer->data)) {
       auto new_buffer = Buffer(

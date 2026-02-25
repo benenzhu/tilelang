@@ -571,7 +571,7 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
     // __syncthreads() will add a vmcnt(0) to final asm, which will break all
     // buffer_load_async and buffer_load_async...lds
     // in tilelang vmcnt should be managed explicitly by cp_async_wait.
-    this->stream << "__syncthreads();\n";
+    this->stream << "__builtin_amdgcn_s_barrier();\n";
   }
 }
 
@@ -583,7 +583,7 @@ void CodeGenTileLangHIP::PrintStorageScope(const std::string &scope,
   if (scope == "shared") {
     os << "__shared__ ";
   } else if (scope == "shared.dyn") {
-    os << "extern __shared__ __align__(1024) ";
+    os << "__shared__ __align__(1024) ";
   }
 }
 
@@ -1148,7 +1148,13 @@ void CodeGenTileLangHIP::VisitStmt_(const AllocateNode *op) {
   PrintType(op->dtype, stream);
 
   if (scope == "shared.dyn") {
-    stream << ' ' << vid << "[];\n";
+    // HIP: emit a fixed-size static __shared__ array instead of a
+    // zero-length extern array.  See PrintStorageScope for rationale.
+    size_t constant_size = op->ConstantAllocationSize();
+    ICHECK_GT(constant_size, 0)
+        << "HIP shared.dyn allocation must have constant size "
+        << "to be emitted as static __shared__";
+    stream << ' ' << vid << '[' << constant_size << "];\n";
   } else {
     size_t constant_size = op->ConstantAllocationSize();
     ICHECK_GT(constant_size, 0)

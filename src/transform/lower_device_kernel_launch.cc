@@ -138,8 +138,8 @@ private:
         runtime::StorageScope::Create(GetPtrStorageScope(op->buffer_var));
     if (storage_scope.rank == runtime::StorageRank::kShared &&
         storage_scope.tag == ".dyn") {
-      ICHECK(!dyn_shmem_size.defined())
-          << "Only one dynamic shared memory allocation is allowed.";
+      // ICHECK(!dyn_shmem_size.defined())
+      //     << "Only one dynamic shared memory allocation is allowed.";
       ICHECK_GT(op->extents.size(), 0);
 
       PrimExpr dyn_size = Integer(1);
@@ -148,7 +148,15 @@ private:
       }
       dyn_size *= op->dtype.bytes() * op->dtype.lanes();
 
-      dyn_shmem_size = dyn_size;
+      // Accumulate sizes from multiple shared.dyn allocations (e.g. when
+      // MergeSharedMemoryAllocations is intentionally skipped so that each
+      // buffer becomes a separate __shared__ variable).
+      if (dyn_shmem_size.defined()) {
+        dyn_shmem_size = dyn_shmem_size.value() + dyn_size;
+      } else {
+        dyn_shmem_size = dyn_size;
+      }
+      dyn_shmem_size = 0;
     }
     StmtVisitor::VisitStmt_(op);
   }

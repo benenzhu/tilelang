@@ -38,6 +38,18 @@ __device__ void inc_m0(uint32_t m0_inc) {
   asm volatile("s_add_u32 m0, %0, m0" : : "n"(m0_inc) : "memory");
 }
 
+// LLVM intrinsic: async global-to-LDS transfer (gfx950+: supports 4/12/16 bytes)
+// On gfx950, buffer_load_b128 ... lds: each lane loads N bytes from global,
+// writes to LDS at m0 + lane_id * N.
+__device__ void
+llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,
+                                as3_uint32_ptr lds_ptr,
+                                index_t size,
+                                index_t voffset,
+                                index_t soffset,
+                                index_t offset,
+                                index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
 namespace tl {
 
 // AMDGPU automatically commit memory fence

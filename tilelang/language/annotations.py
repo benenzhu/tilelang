@@ -16,12 +16,12 @@ __all__ = [
 ]
 
 
-def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
+def use_swizzle(panel_size: int, order: str = "row", enable: bool = True, use_amd_remap: bool = False):
     """Annotate a kernel to use a specific threadblock swizzle pattern."""
     device_func = "rasterization2DRow" if order == "row" else "rasterization2DColumn"
     if not enable:
         return None
-    return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}>")
+    return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}, {'true' if use_amd_remap else 'false'}>")
 
 
 def annotate_layout(layout_map: dict):
