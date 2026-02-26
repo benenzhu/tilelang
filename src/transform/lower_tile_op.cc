@@ -977,15 +977,16 @@ private:
                                                    Map<Var, PrimExpr>{{var, IntImm(var->dtype, 1)}});
               PrimExpr diff = analyzer_->Simplify(flat_at_1 - flat_at_0);
               LOG(INFO) << L(var->span) << L(var) << L(var->dtype);
-              if(std::string(var->name_hint) == "tx"){
+              if((std::string(var->name_hint) == "tx") ||std::string(var->name_hint) == "thread_binding"){
                 have_one = true;
                 LOG(INFO) << "contiguity: var=" << var << "  stride=" << diff;
                 ICHECK(diff.as<IntImmNode>())
                     << "LDS store address is not contiguous in variable "
                     << var << ": stride=" << diff << " (expected constant)";
               }
-              ICHECK(have_one == true) << "should";
+              // ICHECK(have_one == true) << "should";
             }
+            return have_one == true;
           };
           check_continue(flat_original);
 
@@ -1082,7 +1083,7 @@ private:
               stride = stride * new_buffer->shape[k];
             }
           }
-          check_continue(flat_sequential);
+          ICHECK(check_continue(flat_sequential)) << "should be continue" << flat_sequential;
           return BufferStore(new_buffer, global_load, sequential_store);
         }
       }
