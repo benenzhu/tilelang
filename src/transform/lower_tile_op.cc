@@ -959,10 +959,10 @@ private:
           // Verify contiguity: flat_original must have constant stride
           // in every free variable (→ contiguous LDS access pattern).
           // For thread var tx the stride equals vector_size (e.g. 8).
-          {
+          auto check_continue =[this](PrimExpr expr_in){
             std::unordered_set<const VarNode *> seen;
             Array<Var> free_vars;
-            PostOrderVisit(flat_original, [&](const ObjectRef &node) {
+            PostOrderVisit(expr_in, [&](const ObjectRef &node) {
               if (auto *v = node.as<VarNode>()) {
                 if (seen.insert(v).second) {
                   free_vars.push_back(Downcast<Var>(node));
@@ -971,9 +971,9 @@ private:
             });
             bool have_one = false; 
             for (const auto &var : free_vars) {
-              PrimExpr flat_at_0 = tir::Substitute(flat_original,
+              PrimExpr flat_at_0 = tir::Substitute(expr_in,
                                                    Map<Var, PrimExpr>{{var, IntImm(var->dtype, 0)}});
-              PrimExpr flat_at_1 = tir::Substitute(flat_original,
+              PrimExpr flat_at_1 = tir::Substitute(expr_in,
                                                    Map<Var, PrimExpr>{{var, IntImm(var->dtype, 1)}});
               PrimExpr diff = analyzer_->Simplify(flat_at_1 - flat_at_0);
               LOG(INFO) << L(var->span) << L(var) << L(var->dtype);
@@ -986,7 +986,8 @@ private:
               }
               ICHECK(have_one == true) << "should";
             }
-          }
+          };
+          check_continue(flat_original);
 
           LOG(INFO) << L(buffer) << L(buffer->shape);
           LOG(INFO) << L(new_buffer) << L(new_buffer->shape);
@@ -1034,6 +1035,16 @@ private:
           LOG(INFO) << "new_load:" << L(new_load_indices);
 
           auto global_load = BufferLoad(load_node->buffer, new_load_indices);
+          
+          PrimExpr flat_sequential = IntImm(DataType::Int(32), 0);
+          {
+            PrimExpr stride = IntImm(DataType::Int(32), 1);
+            for (int k = (int)sequential_store.size() - 1; k >= 0; --k) {
+              flat_sequential = flat_sequential + sequential_store[k] * stride;
+              stride = stride * new_buffer->shape[k];
+            }
+          }
+          check_continue(flat_sequential);
           return BufferStore(new_buffer, global_load, sequential_store);
         }
       }
