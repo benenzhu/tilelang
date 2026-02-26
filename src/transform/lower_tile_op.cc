@@ -918,31 +918,26 @@ private:
           LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
           LOG(INFO) << "------------------";
         }
-        if (false && load_node) {
+        if (load_node) {
+          // reason
+          // For gfx950 buffer_load_lds: move swizzle from shared store
+          // to global load so LDS addresses are contiguous per thread.
+          //
+          // Original:  shared[swizzle(flat)] = global[flat]
+          // Rewritten: shared[flat]          = global[flat + delta]
+          //
+          // where delta = flatten(Forward(idx)) - flatten(idx)
+          //
+          // This works because XOR swizzle is an involution (self-inverse),
+          // so consumers reading shared[swizzle(pos)] still get correct data.
 
-          // resone:  
-          //    on gfx950, we have buffer_load ... lds instructions. 
-          //    it accept only one vgpr to address the index of global_memory in 2GB buffer. 
-          //    Then we should map the index in lds to global_memory index, then this instrction can save a vgpr right?
-          // Use the flatten-space delta approach:
-          // 1. layout->Forward does reshape + swizzle (may change dims,
-          //    e.g. 2D → 3D).
-          // 2. Flatten both the swizzled physical indices and the original
-          //    logical indices into 1D offsets. The reshape terms cancel,
-          //    leaving flat_delta = swizzle(col) - col.
-          // 3. Subtract flat_delta from the last dim of the swizzled store
-          //    indices → sequential store (reshape only, no swizzle).
-          // 4. Add flat_delta to the last dim of the global load indices
-          //    → swizzle moves to the read side.
-
-          // A_s[row, col] -> A_s[swizzled_row, swizzled_col]
-          auto swizzled_store = layout_map_[buffer]->Forward(store->indices); 
+          auto swizzled_store = layout_map_[buffer]->Forward(store->indices);
 
           // Flatten swizzled physical indices using new_buffer shape.
           PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = swizzled_store.size() - 1; k >= 0; --k) {
+            for (int k = (int)swizzled_store.size() - 1; k >= 0; --k) {
               flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
               stride = stride * new_buffer->shape[k];
             }
@@ -952,7 +947,7 @@ private:
           PrimExpr flat_original = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = store->indices.size() - 1; k >= 0; --k) {
+            for (int k = (int)store->indices.size() - 1; k >= 0; --k) {
               flat_original = flat_original + store->indices[k] * stride;
               stride = stride * buffer->shape[k];
             }
@@ -979,8 +974,6 @@ private:
           LOG(INFO) << "after:" << L(sequential_store);
 
           // Load side: add flat_delta to global load indices.
-          // Decompose delta using the original shared buffer shape (same
-          // logical space as the load indices' local part).
           Array<PrimExpr> new_load_indices(load_node->indices.begin(), load_node->indices.end());
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
@@ -992,21 +985,6 @@ private:
           }
 
           auto global_load = BufferLoad(load_node->buffer, new_load_indices);
-
-          // TODO: not need it here.
-          // // if_then_else).
-          // PrimExpr new_value;
-          // if (auto *cast = store_value.as<CastNode>()) {
-          //   new_value = Cast(cast->dtype, new_load);
-          // } else if (auto *call = store_value.as<CallNode>()) {
-          //   // if_then_else(pred, new_load, else_value)
-          //   Array<PrimExpr> new_args = {call->args[0], new_load,
-          //                               call->args[2]};
-          //   new_value = Call(call->dtype, call->op, new_args);
-          // } else {
-          //   new_value = new_load;
-          // }
-
           return BufferStore(new_buffer, global_load, sequential_store);
         }
       }
