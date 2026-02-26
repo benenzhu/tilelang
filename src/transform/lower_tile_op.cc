@@ -878,7 +878,6 @@ private:
     }
     return load;
   }
-  #define L(x) ", " #x ": " << x
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto buffer = store->buffer;
@@ -890,6 +889,7 @@ private:
       layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
       // new added function.
       if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)){
+        #define L(x) ", " #x ": " << x
         LOG(INFO) << L(store);
         LOG(INFO) << L(store->buffer); // A_shared
         LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
