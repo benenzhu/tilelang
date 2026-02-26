@@ -2,6 +2,7 @@ from tilelang import tvm as tvm
 import tilelang.testing
 import tilelang as tl
 import tilelang.language as T
+import pytest
 
 tilelang.testing.set_random_seed()
 tilelang.disable_cache()
@@ -123,19 +124,17 @@ def run_reduce_max(M, N, dtype=T.float16):
     _run_program(program, lambda A: A.max(dim=1).values, atol=1e-2, rtol=1e-2)
 
 
-def test_reduce_sum():
-    MN_zip = [(256, 256), (512, 128), (128, 512)]
-    for dtype in [T.float32, T.int32, T.int64]:
-        for M, N in MN_zip:
-            run_reduce(M, N, dtype, "sum")
+@pytest.mark.parametrize("M,N", [(256, 256), (512, 128), (128, 512)])
+@pytest.mark.parametrize("dtype", [T.float32, T.int32, T.int64])
+def test_reduce_sum(M, N, dtype):
+    run_reduce(M, N, dtype, "sum")
 
 
-def test_reduce_other_op():
-    MN_zip = [(256, 256), (512, 128)]
-    for op in ["max", "min", "abssum", "absmax"]:
-        for dtype in [T.float32, T.int32, T.int64]:
-            for M, N in MN_zip:
-                run_reduce(M, N, dtype, op)
+@pytest.mark.parametrize("M,N", [(256, 256), (512, 128)])
+@pytest.mark.parametrize("dtype", [T.float32, T.int32, T.int64])
+@pytest.mark.parametrize("op", ["max", "min", "abssum", "absmax"])
+def test_reduce_other_op(M, N, dtype, op):
+    run_reduce(M, N, dtype, op)
 
 
 def test_reduce_sum_threads():
@@ -147,10 +146,13 @@ def test_reduce_sum_shared():
     run_reduce(64, 64, op="sum", mode="ss")
 
 
-def test_reduce_max():
-    run_reduce_max(256, 256, T.float16)
-    run_reduce_max(512, 128, T.float16)
-    run_reduce_max(256, 256, T.float32)
+@pytest.mark.parametrize("M,N,dtype", [
+    (256, 256, T.float16),
+    (512, 128, T.float16),
+    (256, 256, T.float32),
+])
+def test_reduce_max(M, N, dtype):
+    run_reduce_max(M, N, dtype)
 
 
 def test_reduce_max_shared():

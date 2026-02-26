@@ -39,6 +39,8 @@ def print_pass(mod: IRModule, pass_name: str) -> None:
         pass_name: Name of the pass that was just applied
     """
     global _print_pass_cnt, _print_pass_mod_origin
+    if not os.environ.get("TL_DUMP_IR", ""):
+        return
 
     print_when_change = should_print_ir_when_change()
     print_when_change = True
