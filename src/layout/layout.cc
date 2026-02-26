@@ -135,8 +135,8 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
     return forward_index_;
   ICHECK_GE(vars.size(), InputDim());
   #define L(x) ", " #x ": " << x
-  LOG(INFO) << L(vars); // vars: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
-  LOG(INFO) << L(forward_index_); // forward_index_: [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
+  // LOG(INFO) << L(vars); // vars: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+  // LOG(INFO) << L(forward_index_); // forward_index_: [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
   // Take the last InputDim() elements for transformation
   Array<PrimExpr> transform_vars;
   for (size_t i = vars.size() - InputDim(); i < vars.size(); i++) {
@@ -158,7 +158,7 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   for (const auto &expr : transformed) {
     result.push_back(expr);
   }
-  LOG(INFO) << L(result); // result: [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+  // LOG(INFO) << L(result); // result: [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
 
   return result;
 }
