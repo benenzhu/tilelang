@@ -891,12 +891,12 @@ private:
       // new added function.
       if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)){
         LOG(INFO) << L(store);
-        LOG(INFO) << L(store->buffer);
-        LOG(INFO) << L(store->value);
-        LOG(INFO) << L(store->indices);
-        LOG(INFO) << L(store->predicate);
-        LOG(INFO) << L(store->span);
-        LOG(INFO) << L(new_indices);
+        LOG(INFO) << L(store->buffer); // A_shared
+        LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+        LOG(INFO) << L(store->indices); // [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+        LOG(INFO) << L(store->predicate); // nullptr
+        LOG(INFO) << L(store->span); // nullptr
+        LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
         const BufferLoadNode *load_node = nullptr; 
         PrimExpr store_value = store->value;
         if (auto *load = store_value.as<BufferLoadNode>()) {
