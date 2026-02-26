@@ -20,6 +20,7 @@
 #include "../op/operator.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
+#include "../layout/swizzle.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "layout_reducer.h"
@@ -886,107 +887,80 @@ private:
     if (buffer_remap_.count(buffer)) { // pass 遍历的时候，如果这个buffer需要做 swizzle 的话
       auto new_buffer = buffer_remap_[store->buffer];
       layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
-      // new added function.
-      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)){
-        #define L(x) ", " #x ": " << x
-        LOG(INFO) << L(store);
-        LOG(INFO) << L(store->buffer); // A_shared
-        LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
-        LOG(INFO) << L(store->indices); // [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
-        LOG(INFO) << L(store->predicate); // nullptr
-        LOG(INFO) << L(store->span); // nullptr
-        // LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
-        const BufferLoadNode *load_node = nullptr; 
+      // For ROCm with SwizzledLayout: move swizzle from shared store
+      // to global load, making LDS addresses contiguous per thread.
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)) {
+        const BufferLoadNode *load_node = nullptr;
         PrimExpr store_value = store->value;
         if (auto *load = store_value.as<BufferLoadNode>()) {
           if (IsGlobalBuffer(load->buffer)) {
             load_node = load;
           }
         }
-        // TODO: may add cast and if_then_else here later? for if else, it can use buffer_load op's size check directly.
-        // else if (auto *cast = store_value.as<CastNode>()) {
-        //   // cast("float16", A[global_row, global_col])
-        //   if (auto *load = cast->value.as<BufferLoadNode>()) {
-        //     if (IsGlobalBuffer(load->buffer)) { // ... 这种也还没见过 ...
-        //       load_node = load;
-        //     }
-        //   }
-        // } else if (auto *call = store_value.as<CallNode>()) {
-        //   // if_then_else(global_row < M, A[global_row, global_col], 0.0f) ... 这种可以忽略，还没见到...
-        //   if (call->op.same_as(builtin::if_then_else()) &&
-        //       call->args.size() == 3) {
-        //     if (auto *load = call->args[1].as<BufferLoadNode>()) {
-        //       if (IsGlobalBuffer(load->buffer)) {
-        //         load_node = load;
-        //       }
-        //     }
-        //   }
-        // }
-
+ 
         if (load_node) {
-          // Use the flatten-space delta approach:
-          // 1. layout->Forward does reshape + swizzle (may change dims,
-          //    e.g. 2D → 3D).
-          // 2. Flatten both the swizzled physical indices and the original
-          //    logical indices into 1D offsets. The reshape terms cancel,
-          //    leaving flat_delta = swizzle(col) - col.
-          // 3. Subtract flat_delta from the last dim of the swizzled store
-          //    indices → sequential store (reshape only, no swizzle).
-          // 4. Add flat_delta to the last dim of the global load indices
-          //    → swizzle moves to the read side.
-
-          // A_s[row, col] -> A_s[swizzled_row, swizzled_col]
-          auto swizzled_store = layout_map_[buffer]->Forward(store->indices); 
-
-          // Flatten swizzled physical indices using new_buffer shape.
-          PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = swizzled_store.size() - 1; k >= 0; --k) {
-              flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
-              stride = stride * new_buffer->shape[k];
-            }
+          // Goal: make LDS store addresses contiguous per thread (for
+          // buffer_load_dword LDS), while keeping data correct for MFMA.
+          //
+          // F = S ∘ R (SwizzledLayout: R = base layout, S = XOR swizzle)
+          // F_inv = R_inv ∘ S  (S is involution)
+          //
+          // Original: shared[F(s)] = global[g(s)]
+          // New:      shared[R(s)] = global[g(F_inv(R(s)))]
+          //         = global[g(R_inv(S(R(s))))]
+          //         = global[g(R_inv(F(s)))]     (since F = S∘R)
+          //
+          // Steps:
+          // 1. R(s) = base_layout.Forward(s) — contiguous store indices
+          // 2. F(s) = full_layout.Forward(s) — swizzled indices
+          // 3. R_inv(F(s)) = base_layout.Inverse().Forward(F(s)) — new logical
+          // 4. new_global = base_offset + R_inv(F(s))
+ 
+          #define L(x) ", " #x ": " << x
+          // LOG(INFO) << L(store);
+          // LOG(INFO) << L(store->buffer); // A_shared
+          // LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+          // LOG(INFO) << L(store->indices); // [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+          // LOG(INFO) << L(store->predicate); // nullptr
+          // LOG(INFO) << L(store->span); // nullptr
+          // // LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+          auto layout = layout_map_[buffer];
+ 
+          // Check if this is a SwizzledLayout, so we can extract base layout
+          auto swizzled_node = layout.as<SwizzledLayoutNode>();
+          if (!swizzled_node) {
+            // Not a SwizzledLayout — fall through to default path
+            auto new_indices = layout->Forward(store->indices);
+            return BufferStore(new_buffer, store->value, new_indices);
           }
-
-          // Flatten original logical indices using original buffer shape.
-          PrimExpr flat_original = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = store->indices.size() - 1; k >= 0; --k) {
-              flat_original = flat_original + store->indices[k] * stride;
-              stride = stride * buffer->shape[k];
-            }
+ 
+          // Step 1: R(s) = base layout Forward (without swizzle)
+          // Construct a plain Layout from the base forward_index_
+          Layout base_layout(layout->InputShape(), layout->GetForwardIndex());
+          auto base_store = base_layout->Forward(store->indices);
+ 
+          // Step 2: F(s) = full swizzled Forward
+          auto swizzled_store = layout->Forward(store->indices);
+ 
+          // Step 3: R_inv(F(s)) — inverse of base layout applied to F(s)
+          // The base layout (LayoutNode) has an affine Inverse.
+          auto base_inv = base_layout->Inverse();
+          auto new_logical = base_inv->Forward(swizzled_store);
+ 
+          // Step 4: new_global[k] = base_offset[k] + new_logical[k]
+          int orig_ndim = static_cast<int>(store->indices.size());
+          ICHECK_EQ(static_cast<int>(load_node->indices.size()), orig_ndim);
+          ICHECK_EQ(static_cast<int>(new_logical.size()), orig_ndim);
+          Array<PrimExpr> new_load_indices;
+          for (int k = 0; k < orig_ndim; ++k) {
+            PrimExpr base_k = analyzer_->Simplify(
+                load_node->indices[k] - store->indices[k]);
+            new_load_indices.push_back(analyzer_->Simplify(
+                base_k + new_logical[k]));
           }
-
-          // 这个也就是解出来 flatten 空间中 swizzle 和 original 的插值了吧.
-          PrimExpr flat_delta = analyzer_->Simplify(flat_swizzled - flat_original);
-
-          // share_store: remove swizzle from the last dimension.
-          int last_s = swizzled_store.size() - 1;
-          swizzled_store.Set(last_s, analyzer_->Simplify(swizzled_store[last_s] - flat_delta));
-
-          // global_load: add swizzle to the last dimension of global indices.
-          Array<PrimExpr> new_load_indices(load_node->indices.begin(), load_node->indices.end());
-          int last_l = new_load_indices.size() - 1;
-          new_load_indices.Set(last_l, analyzer_->Simplify(load_node->indices[last_l] + flat_delta));
-
+ 
           auto global_load = BufferLoad(load_node->buffer, new_load_indices);
-
-          // TODO: not need it here.
-          // // if_then_else).
-          // PrimExpr new_value;
-          // if (auto *cast = store_value.as<CastNode>()) {
-          //   new_value = Cast(cast->dtype, new_load);
-          // } else if (auto *call = store_value.as<CallNode>()) {
-          //   // if_then_else(pred, new_load, else_value)
-          //   Array<PrimExpr> new_args = {call->args[0], new_load,
-          //                               call->args[2]};
-          //   new_value = Call(call->dtype, call->op, new_args);
-          // } else {
-          //   new_value = new_load;
-          // }
-
-          return BufferStore(new_buffer, global_load, swizzled_store);
+          return BufferStore(new_buffer, global_load, base_store);
         }
       }
 

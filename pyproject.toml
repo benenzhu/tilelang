@@ -33,13 +33,13 @@ dependencies = [
     "apache-tvm-ffi~=0.1.0,>=0.1.2",
     # torch-c-dlpack-ext provides prebuilt torch extensions.
     # Without it, TVM FFI may require JIT compilation on first import.
-    "torch-c-dlpack-ext; python_version < '3.14'",
+    # "torch-c-dlpack-ext; python_version < '3.14'",
     "cloudpickle",
     "ml-dtypes",
     "numpy>=1.23.5",
     "psutil",
-    "torch",
-    "torch>=2.4; platform_system == 'Darwin'",
+    # "torch",
+    # "torch>=2.4; platform_system == 'Darwin'",
     # jit-compiling a torch extension needs setuptools
     "setuptools; platform_system == 'Darwin'",
     "tqdm>=4.62.3",
@@ -281,5 +281,5 @@ select = "*linux*x86_64*"
 # x86_64 runners in GitHub Actions have limited storage,
 # pre-install torch without caching to reduce disk usage during install tilelang.
 before-test = [
-    "pip install torch --no-cache-dir",
+    #"pip install torch --no-cache-dir",
 ]
