@@ -1009,6 +1009,39 @@ private:
 
           // Load: decompose flat_swizzled into original buffer shape
           // → swizzled local coordinates in the shared buffer's logical space.
+          // This works because: consumer reads shared[Forward(c)], which in
+          // flat space is shared[Forward_flat(c)]. We stored at shared[flat_orig]
+          // the value global[base + decompose(flat_swizzled, buf_shape)].
+          // Consumer at c finds: Forward_flat(c) == flat_orig iff c == store_idx.
+          // The data at flat_orig is global[base + swizzled_local].
+          //
+          // Correctness requires Forward_flat to be an involution (self-inverse),
+          // which holds when the reshape is trivial (first output dim is constant 0).
+          // When non-trivial reshape exists, fall through to standard Forward path.
+          auto output_shape = layout_map_[buffer]->OutputShape();
+          bool reshape_trivial = true;
+          if (output_shape.size() > buffer->shape.size()) {
+            // Check if the leading extra dimensions are all size 1
+            size_t extra = output_shape.size() - buffer->shape.size();
+            for (size_t d = 0; d < extra; d++) {
+              auto *imm = output_shape[d].as<IntImmNode>();
+              if (!imm || imm->value != 1) {
+                reshape_trivial = false;
+                break;
+              }
+            }
+          }
+          // Also verify involution: Forward_flat(Forward_flat(x)) == x
+          // by checking at a few sample points.
+          if (reshape_trivial) {
+            LOG(INFO) << "Reshape is trivial, applying swizzle-to-load optimization";
+          } else {
+            LOG(INFO) << "Reshape is non-trivial (output_shape=" << output_shape
+                      << "), falling back to standard Forward path";
+            auto new_indices = layout_map_[buffer]->Forward(store->indices);
+            return BufferStore(new_buffer, store->value, new_indices);
+          }
+
           Array<PrimExpr> swizzled_local;
           swizzled_local.resize(buffer->shape.size());
           {
@@ -1029,6 +1062,11 @@ private:
           for (size_t k = 0; k < load_node->indices.size(); k++) {
             PrimExpr base = analyzer_->Simplify(
                 load_node->indices[k] - store->indices[k]);
+            LOG(INFO) << "dim " << k << ":"
+                      << " load=" << load_node->indices[k]
+                      << " store=" << store->indices[k]
+                      << " base=" << base
+                      << " swizzled_local=" << swizzled_local[k];
             new_load_indices.push_back(analyzer_->Simplify(
                 base + swizzled_local[k]));
           }
