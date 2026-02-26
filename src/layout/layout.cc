@@ -106,8 +106,8 @@ Array<PrimExpr> LayoutNode::OutputShape() const {
   for (size_t i = 0; i < ret.size(); i++) {
     auto ist = analyzer.int_set(forward_index_[i] + 1);
     #define L(x) "," #x ": " << x
-    LOG(INFO) << L(forward_index_[i] + 1);
-    LOG(INFO) << L(ist);
+    // LOG(INFO) << L(forward_index_[i] + 1);
+    // LOG(INFO) << L(ist);
     if (arith::is_neg_inf(ist.min()) && arith::is_pos_inf(ist.max())) {
       // Analyzer couldn't form an IntervalSet (e.g. bitwise ops).
       // Fall back to ConstIntBound to derive a safe extent.

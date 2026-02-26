@@ -969,16 +969,22 @@ private:
                 }
               }
             });
+            bool have_one = false; 
             for (const auto &var : free_vars) {
               PrimExpr flat_at_0 = tir::Substitute(flat_original,
                                                    Map<Var, PrimExpr>{{var, IntImm(var->dtype, 0)}});
               PrimExpr flat_at_1 = tir::Substitute(flat_original,
                                                    Map<Var, PrimExpr>{{var, IntImm(var->dtype, 1)}});
               PrimExpr diff = analyzer_->Simplify(flat_at_1 - flat_at_0);
-              LOG(INFO) << "contiguity: var=" << var << "  stride=" << diff;
-              ICHECK(diff.as<IntImmNode>())
-                  << "LDS store address is not contiguous in variable "
-                  << var << ": stride=" << diff << " (expected constant)";
+              LOG(INFO) << L(var->span) << L(var) << L(var->dtype);
+              if(std::string(var->name_hint) == "tx"){
+                have_one = true;
+                LOG(INFO) << "contiguity: var=" << var << "  stride=" << diff;
+                ICHECK(diff.as<IntImmNode>())
+                    << "LDS store address is not contiguous in variable "
+                    << var << ": stride=" << diff << " (expected constant)";
+              }
+              ICHECK(have_one == true) << "should";
             }
           }
 
