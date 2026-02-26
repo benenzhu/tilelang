@@ -923,7 +923,7 @@ private:
         //   }
         // }
 
-        if (false && load_node) {
+        if (load_node) {
           // Use the flatten-space delta approach:
           // 1. layout->Forward does reshape + swizzle (may change dims,
           //    e.g. 2D → 3D).
