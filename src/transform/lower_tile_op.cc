@@ -900,29 +900,44 @@ private:
         // Extract the BufferLoad from global memory.
         // Handle patterns: BufferLoad, Cast(BufferLoad),
         // if_then_else(pred, BufferLoad, zero).
+        #define L(x) ", " #x ": " << x
+        LOG(INFO) << L(store);
+        LOG(INFO) << L(store->buffer); // A_shared
+        LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+        LOG(INFO) << L(store->indices); // [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+        LOG(INFO) << L(store->predicate); // nullptr
+        LOG(INFO) << L(store->span); // nullptr        
+        LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
         const BufferLoadNode *load_node = nullptr;
-        PrimExpr store_value = store->value;
+        PrimExpr store_value = store->value; // globla addr
+
 
         if (auto *load = store_value.as<BufferLoadNode>()) {
+          // A[global_row, global_col]
           if (IsGlobalBuffer(load->buffer)) {
             load_node = load;
           }
-        } else if (auto *cast = store_value.as<CastNode>()) {
-          if (auto *load = cast->value.as<BufferLoadNode>()) {
-            if (IsGlobalBuffer(load->buffer)) {
-              load_node = load;
-            }
-          }
-        } else if (auto *call = store_value.as<CallNode>()) {
-          if (call->op.same_as(builtin::if_then_else()) &&
-              call->args.size() == 3) {
-            if (auto *load = call->args[1].as<BufferLoadNode>()) {
-              if (IsGlobalBuffer(load->buffer)) {
-                load_node = load;
-              }
-            }
-          }
-        }
+        } 
+        
+        // TODO: may add cast and if_then_else here later? for if else, it can use buffer_load op's size check directly.
+        // else if (auto *cast = store_value.as<CastNode>()) {
+        //   // cast("float16", A[global_row, global_col])
+        //   if (auto *load = cast->value.as<BufferLoadNode>()) {
+        //     if (IsGlobalBuffer(load->buffer)) { // ... 这种也还没见过 ...
+        //       load_node = load;
+        //     }
+        //   }
+        // } else if (auto *call = store_value.as<CallNode>()) {
+        //   // if_then_else(global_row < M, A[global_row, global_col], 0.0f) ... 这种可以忽略，还没见到...
+        //   if (call->op.same_as(builtin::if_then_else()) &&
+        //       call->args.size() == 3) {
+        //     if (auto *load = call->args[1].as<BufferLoadNode>()) {
+        //       if (IsGlobalBuffer(load->buffer)) {
+        //         load_node = load;
+        //       }
+        //     }
+        //   }
+        // }
 
         if (load_node) {
           // Use the flatten-space delta approach:
@@ -936,14 +951,14 @@ private:
           // 4. Add flat_delta to the last dim of the global load indices
           //    → swizzle moves to the read side.
 
-          auto swizzled_store = layout->Forward(store->indices);
+          // A_s[row, col] -> A_s[swizzled_row, swizzled_col]
+          auto swizzled_store = layout->Forward(store->indices); 
 
           // Flatten swizzled physical indices using new_buffer shape.
           PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = static_cast<int>(swizzled_store.size()) - 1; k >= 0;
-                 --k) {
+            for (int k = swizzled_store.size() - 1; k >= 0; --k) {
               flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
               stride = stride * new_buffer->shape[k];
             }
@@ -953,49 +968,41 @@ private:
           PrimExpr flat_original = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = static_cast<int>(store->indices.size()) - 1; k >= 0;
-                 --k) {
+            for (int k = store->indices.size() - 1; k >= 0; --k) {
               flat_original = flat_original + store->indices[k] * stride;
               stride = stride * buffer->shape[k];
             }
           }
 
-          PrimExpr flat_delta =
-              analyzer_->Simplify(flat_swizzled - flat_original);
+          // 这个也就是解出来 flatten 空间中 swizzle 和 original 的插值了吧.
+          PrimExpr flat_delta = analyzer_->Simplify(flat_swizzled - flat_original);
 
-          // Store side: remove swizzle from the last dimension.
-          Array<PrimExpr> seq_store(swizzled_store.begin(),
-                                    swizzled_store.end());
-          int last_s = static_cast<int>(seq_store.size()) - 1;
-          seq_store.Set(last_s,
-                        analyzer_->Simplify(swizzled_store[last_s] - flat_delta));
+          // share_store: remove swizzle from the last dimension.
+          int last_s = swizzled_store.size() - 1;
+          swizzled_store.Set(last_s, analyzer_->Simplify(swizzled_store[last_s] - flat_delta));
 
-          // Load side: add swizzle to the last dimension of global indices.
-          Array<PrimExpr> new_load_indices(load_node->indices.begin(),
-                                           load_node->indices.end());
-          int last_l = static_cast<int>(new_load_indices.size()) - 1;
-          new_load_indices.Set(
-              last_l,
-              analyzer_->Simplify(load_node->indices[last_l] + flat_delta));
+          // global_load: add swizzle to the last dimension of global indices.
+          Array<PrimExpr> new_load_indices(load_node->indices.begin(), load_node->indices.end());
+          int last_l = new_load_indices.size() - 1;
+          new_load_indices.Set(last_l, analyzer_->Simplify(load_node->indices[last_l] + flat_delta));
 
-          auto new_load = BufferLoad(load_node->buffer, new_load_indices);
+          auto global_load = BufferLoad(load_node->buffer, new_load_indices);
 
-          // Rebuild store value preserving any wrapping (Cast /
-          // if_then_else).
-          PrimExpr new_value;
-          if (auto *cast = store_value.as<CastNode>()) {
-            new_value = Cast(cast->dtype, new_load);
-          } else if (auto *call = store_value.as<CallNode>()) {
-            // if_then_else(pred, new_load, else_value)
-            Array<PrimExpr> new_args = {call->args[0], new_load,
-                                        call->args[2]};
-            new_value = Call(call->dtype, call->op, new_args);
-          } else {
-            new_value = new_load;
-          }
+          // TODO: not need it here.
+          // // if_then_else).
+          // PrimExpr new_value;
+          // if (auto *cast = store_value.as<CastNode>()) {
+          //   new_value = Cast(cast->dtype, new_load);
+          // } else if (auto *call = store_value.as<CallNode>()) {
+          //   // if_then_else(pred, new_load, else_value)
+          //   Array<PrimExpr> new_args = {call->args[0], new_load,
+          //                               call->args[2]};
+          //   new_value = Call(call->dtype, call->op, new_args);
+          // } else {
+          //   new_value = new_load;
+          // }
 
-          // Store with sequential (un-swizzled) indices.
-          return BufferStore(new_buffer, new_value, seq_store);
+          return BufferStore(new_buffer, global_load, swizzled_store);
         }
       }
 
