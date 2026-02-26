@@ -33,6 +33,10 @@ using namespace tir;
 
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
+  #define L(x) "," #x ": " << x
+  LOG(INFO) << L(buffer);
+  LOG(INFO) << L(layout);
+  LOG(INFO) << L(layout->OutputShape());
   const auto *ptr_type =
       TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
   Type new_type;
@@ -57,7 +61,7 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
   Array<PrimExpr> output_shape = layout_shape;
   if (ptr_type->storage_scope == "shared" ||
       ptr_type->storage_scope == "shared.dyn") {
-    int replicate_extent = 1;
+    int replicate_extent = 1; // 这东西还能不是1么 ？啥时候呀
     Array<PrimExpr> buffer_shape = buffer->shape;
     int buffer_extent = 1;
     int layout_extent = 1;
@@ -73,6 +77,7 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
     }
     replicate_extent = buffer_extent / layout_extent;
     if (replicate_extent > 1) {
+      ICHECK(false) << "replicate_extent > 1";
       output_shape.insert(output_shape.begin(), replicate_extent);
     }
   }
@@ -899,7 +904,22 @@ private:
         }
         #define L(x) " ," #x ": " << x
  
+        if(load_node){
+          LOG(INFO) << "==================";
+          LOG(INFO) << L(store->buffer);
+          LOG(INFO) << L(store->indices); // ,store->indices: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->value); // B[bx * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->predicate);
+          LOG(INFO) << L(store->span);
+          LOG(INFO) << L(layout_map_[buffer]->GetForwardIndex()); 
+          // [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
+          // [1, 32, 512]
+          auto new_indices = layout_map_[buffer]->Forward(store->indices);
+          LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+          LOG(INFO) << "------------------";
+        }
         if (false && load_node) {
+
           // resone:  
           //    on gfx950, we have buffer_load ... lds instructions. 
           //    it accept only one vgpr to address the index of global_memory in 2GB buffer. 

@@ -487,17 +487,19 @@ static Layout MakeFullBankSwizzleLayout2D(int stride, int continuous,
   // Swizzle 3 bit
   Var i = InputPlaceholder(0);
   Var j = InputPlaceholder(1);
-  int vector_size = 128 / element_size;
-  ICHECK(stride % 8 == 0) << "stride=" << stride;
-  ICHECK(continuous % (vector_size * 8) == 0)
+  int vector_size = 128 / element_size; // ele_size = 16, vector_size = 8, 8 ele here.
+  ICHECK(stride % 8 == 0) << "stride=" << stride; // stride = 256
+  ICHECK(continuous % (vector_size * 8) == 0) // continuous = 256.
       << "continuous=" << continuous << ", vector_size=" << vector_size;
-  PrimExpr ts = FloorDiv(i, 8);
-  PrimExpr s = FloorMod(i, 8);
-  PrimExpr tc = FloorDiv(FloorDiv(j, vector_size), 8);
-  PrimExpr c = FloorMod(FloorDiv(j, vector_size), 8);
-  PrimExpr vec = FloorMod(j, vector_size);
-  PrimExpr c_swizzle = xor8x8(c, s);
-  PrimExpr index = vec + (c_swizzle + s * 8) * vector_size;
+  PrimExpr ts = FloorDiv(i, 8); // _i / 8 -> range [0,32]
+  PrimExpr s = FloorMod(i, 8); // _i % 8 -> range [0,8]
+  PrimExpr tc = FloorDiv(FloorDiv(j, vector_size), 8); // (_j/8)/8 -> range [0,1] = 0
+  PrimExpr c = FloorMod(FloorDiv(j, vector_size), 8); // (_j/8)%8 -> range [0,1]
+  PrimExpr vec = FloorMod(j, vector_size); // range [0,8]
+  PrimExpr c_swizzle = xor8x8(c, s); // XOR swizzle
+  PrimExpr index = vec + (c_swizzle + s * 8) * vector_size; // range [0,512]
+  #define L(x) "," #x ": " << x
+  LOG(INFO) << L(index) << L(index->dtype) << L(index->span);
   return Layout(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
 }
 
