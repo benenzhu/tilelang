@@ -3,6 +3,7 @@ import tilelang.testing
 import tilelang as tl
 import torch
 import tilelang.language as T
+import pytest
 
 
 def cumsum_smem_test(M, N, block_M, block_N, dim=0, reverse=False, dtype=T.float32):
@@ -142,25 +143,24 @@ def run_cumsum_1d(N, block_N, reverse=False, dtype=T.float32, scope="smem"):
     torch.testing.assert_close(tilelang_res, ref_res, atol=1e-3, rtol=1e-3)
 
 
-def test_cumsum_smem():
-    # Test different sizes
-    run_cumsum(1024, 1024, 128, 128)
-    run_cumsum(1024, 1024, 128, 128, dim=1)
-    run_cumsum(1024, 1024, 128, 128, dim=1, reverse=True)
+@pytest.mark.parametrize("M,N,block_M,block_N,dim,reverse,dtype", [
+    (1024, 1024, 128, 128, 0, False, T.float32),
+    (1024, 1024, 128, 128, 1, False, T.float32),
+    (1024, 1024, 128, 128, 1, True, T.float32),
+    (256, 256, 128, 128, 0, False, T.float32),
+])
+def test_cumsum_smem(M, N, block_M, block_N, dim, reverse, dtype):
+    run_cumsum(M, N, block_M, block_N, dim=dim, reverse=reverse, dtype=dtype)
 
-    # Test different dtypes
-    run_cumsum(256, 256, 128, 128, dtype=T.float32)
-    run_cumsum(256, 256, 128, 128, dtype=T.float32)
 
-
-def test_cumsum_fragment():
-    run_cumsum(1024, 1024, 128, 128, scope="fragment")
-    run_cumsum(1024, 1024, 128, 128, dim=1, scope="fragment")
-    run_cumsum(1024, 1024, 128, 128, dim=1, reverse=True, scope="fragment")
-
-    # Test different dtypes
-    run_cumsum(256, 256, 128, 128, dtype=T.float32, scope="fragment")
-    run_cumsum(256, 256, 128, 128, dtype=T.float32, scope="fragment")
+@pytest.mark.parametrize("M,N,block_M,block_N,dim,reverse,dtype", [
+    (1024, 1024, 128, 128, 0, False, T.float32),
+    (1024, 1024, 128, 128, 1, False, T.float32),
+    (1024, 1024, 128, 128, 1, True, T.float32),
+    (256, 256, 128, 128, 0, False, T.float32),
+])
+def test_cumsum_fragment(M, N, block_M, block_N, dim, reverse, dtype):
+    run_cumsum(M, N, block_M, block_N, dim=dim, reverse=reverse, dtype=dtype, scope="fragment")
 
 
 def test_cumsum_smem_1d():

@@ -138,7 +138,6 @@ class LibraryGenerator:
         try:
             if verbose:
                 print(f"compile_lib compilation command: {' '.join(command)}")
-            print(__file__, f"compile_lib compilation command: {' '.join(command)}")
             ret = subprocess.run(command, timeout=timeout)
         except Exception as e:
             raise RuntimeError(f"Compile kernel failed because of {e}") from e

@@ -16,14 +16,14 @@ def _should_interleave_g2s(pass_ctx: PassContext | None = None) -> bool:
     """Check if G2S/MFMA interleaving is enabled."""
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
-    return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_INTERLEAVE_G2S, False))
+    return bool(pass_ctx and True) #pass_ctx.config.get(tilelang.PassConfigKey.TL_INTERLEAVE_G2S, False))
 
 
 def should_print_ir_when_change(pass_ctx: PassContext | None = None) -> bool:
     """Check if IR should be printed when a pass causes changes."""
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
-    return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_PRINT_IR_WHEN_CHANGE, False))
+    return bool(pass_ctx and True) #pass_ctx.config.get(tilelang.PassConfigKey.TL_PRINT_IR_WHEN_CHANGE, False))
 
 _print_pass_cnt = 0
 _print_pass_mod_origin = None
@@ -39,6 +39,8 @@ def print_pass(mod: IRModule, pass_name: str) -> None:
         pass_name: Name of the pass that was just applied
     """
     global _print_pass_cnt, _print_pass_mod_origin
+    if not os.environ.get("TL_DUMP_IR", ""):
+        return
 
     print_when_change = should_print_ir_when_change()
     print_when_change = True

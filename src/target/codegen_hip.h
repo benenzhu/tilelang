@@ -17,7 +17,7 @@
 
 #include "target/source/codegen_c.h"
 
-namespace tvm{
+namespace tvm {
 namespace codegen {
 
 class CodeGenTileLangHIP final : public CodeGenC {

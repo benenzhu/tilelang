@@ -109,6 +109,7 @@ class GemmMFMA(GemmBase):
             mfma_k_dim=_get_mfma_k_dim(target, self.in_dtype),
         )
 
+        k_pack = mfma_emitter.k_pack
         in_dtype = self.in_dtype
         warp_rows = mfma_emitter.warp_rows
         warp_cols = mfma_emitter.warp_cols
@@ -129,7 +130,10 @@ class GemmMFMA(GemmBase):
 
         clear_accum = self.clear_accum
 
-        assert block_K >= micro_size_k, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k})"
+        assert block_K >= micro_size_k * k_pack, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
+        assert block_K % (micro_size_k * k_pack) == 0, (
+            f"block_K ({block_K}) must be divisible by micro_size_k ({micro_size_k}) * k_pack ({k_pack})"
+        )
 
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
@@ -183,11 +187,16 @@ class GemmMFMA(GemmBase):
 
             @T.prim_func
             def _gemm_ssr() -> None:
-                A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
-                B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
+                """
+                The inner macro that loads data from shared buffers A_shared and
+                B_shared into local fragments, then issues Matrix Core mfma ops,
+                accumulating into C_local.
+                """
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load A into fragment
                     mfma_emitter.ldmatrix_a(
                         A_local,
@@ -218,12 +227,12 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a * self.k_pack), in_dtype)
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
 
                 if clear_accum:
                     T.clear(C_buf)
 
-                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load A into fragment
                     mfma_emitter.ldmatrix_a(
                         A_local,
@@ -249,10 +258,10 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                B_local = T.alloc_local((warp_cols * local_size_b * self.k_pack), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * self.k_pack))):
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                     # Load B into fragment
                     mfma_emitter.ldmatrix_b(
                         B_local,

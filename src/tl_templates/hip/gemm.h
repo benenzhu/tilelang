@@ -29,7 +29,7 @@ template <> struct MfmaTraits<half> {
   }
 };
 
-// Specialization for bfloat16_t (CDNA2/3: 16x16x16, vec_size=4)
+// Specialization for bfloat16_t
 template <int KDim = 16> struct MfmaBf16Traits;
 
 template <> struct MfmaBf16Traits<16> {

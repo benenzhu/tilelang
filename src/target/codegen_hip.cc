@@ -698,10 +698,10 @@ void CodeGenTileLangHIP::PrintStorageSync(const CallNode *op) {
     // DO nothing.
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
-    // Use bare s_barrier (without the implicit s_waitcnt vmcnt(0) that
-    // __syncthreads() adds).  This lets the async G2S pipeline (buffer_load
-    // ... lds) overlap loads with compute — vmcnt is managed explicitly by
-    // cp_async_wait.
+    // TODO: change to __builtin_amdgcn_s_barrier() later
+    // __syncthreads() will add a vmcnt(0) to final asm, which will break all
+    // buffer_load_async and buffer_load_async...lds
+    // in tilelang vmcnt should be managed explicitly by cp_async_wait.
     this->stream << "__builtin_amdgcn_s_barrier();\n";
   }
 }

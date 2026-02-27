@@ -20,6 +20,7 @@
 #include "../op/operator.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
+#include "../layout/swizzle.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "layout_reducer.h"
@@ -32,6 +33,10 @@ using namespace tir;
 
 static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
                                    Map<Var, Var> &var_remap) {
+  #define L(x) "," #x ": " << x
+  LOG(INFO) << L(buffer);
+  LOG(INFO) << L(layout);
+  LOG(INFO) << L(layout->OutputShape());
   const auto *ptr_type =
       TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
   Type new_type;
@@ -72,6 +77,7 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout,
     }
     replicate_extent = buffer_extent / layout_extent;
     if (replicate_extent > 1) {
+      ICHECK(false) << "replicate_extent > 1";
       output_shape.insert(output_shape.begin(), replicate_extent);
     }
   }
@@ -878,136 +884,92 @@ private:
     }
     return load;
   }
-
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto buffer = store->buffer;
-    if (buffer_remap_.count(buffer)) {
-      auto layout = layout_map_[buffer];
+    // LOG(INFO) << L(store);
+    // LOG(INFO) << "store->buffer: " << store->buffer << " " << "count: " << buffer_remap_.count(buffer);
+    if (buffer_remap_.count(buffer)) { // pass 遍历的时候，如果这个buffer需要做 swizzle 的话
       auto new_buffer = buffer_remap_[store->buffer];
-      layout_remap_.Set(new_buffer, layout);
-
-      // On ROCm/HIP targets, for G2S copy (store to shared memory from global
-      // memory), swap the swizzle from the store (LDS) side to the load
-      // (global) side. This makes LDS writes sequential by thread ID,
-      // preparing for the truly async buffer_load_b128...lds instruction
-      // where hardware forces the write pattern: m0 + lane_id * N.
-      //
-      // The final LDS content is identical because we are just reassigning
-      // which thread reads which global element — the XOR swizzle is its own
-      // inverse, so the permutation of data into LDS positions is preserved.
-      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)) {
-        // Extract the BufferLoad from global memory.
-        // Handle patterns: BufferLoad, Cast(BufferLoad),
-        // if_then_else(pred, BufferLoad, zero).
-        #define L(x) ", " #x ": " << x
-        LOG(INFO) << L(store);
-        LOG(INFO) << L(store->buffer); // A_shared
-        LOG(INFO) << L(store->value); // A[by * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
-        LOG(INFO) << L(store->indices); // [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
-        LOG(INFO) << L(store->predicate); // nullptr
-        LOG(INFO) << L(store->span); // nullptr        
-        LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+      layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
+      // For ROCm with SwizzledLayout: move swizzle from shared store
+      // to global load, making LDS addresses contiguous per thread.
+      // For ROCm g2s with swizzled layout: move swizzle from shared store
+      // to global load, making LDS addresses contiguous per thread.
+      // Only applies when:
+      //   1. Target is ROCm
+      //   2. Store is to shared memory
+      //   3. Value is a global load (g2s copy)
+      //   4. Layout has XOR swizzle (HasSwizzle() == true)
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer) &&
+          layout_map_[buffer]->HasSwizzle()) {
         const BufferLoadNode *load_node = nullptr;
-        PrimExpr store_value = store->value; // globla addr
-
-
-        if (auto *load = store_value.as<BufferLoadNode>()) {
-          // A[global_row, global_col]
+        PrimExpr store_value = store->value;
+        if (auto *load = stor{
           if (IsGlobalBuffer(load->buffer)) {
             load_node = load;
           }
-        } 
-        
-        // TODO: may add cast and if_then_else here later? for if else, it can use buffer_load op's size check directly.
-        // else if (auto *cast = store_value.as<CastNode>()) {
-        //   // cast("float16", A[global_row, global_col])
-        //   if (auto *load = cast->value.as<BufferLoadNode>()) {
-        //     if (IsGlobalBuffer(load->buffer)) { // ... 这种也还没见过 ...
-        //       load_node = load;
-        //     }
-        //   }
-        // } else if (auto *call = store_value.as<CallNode>()) {
-        //   // if_then_else(global_row < M, A[global_row, global_col], 0.0f) ... 这种可以忽略，还没见到...
-        //   if (call->op.same_as(builtin::if_then_else()) &&
-        //       call->args.size() == 3) {
-        //     if (auto *load = call->args[1].as<BufferLoadNode>()) {
-        //       if (IsGlobalBuffer(load->buffer)) {
-        //         load_node = load;
-        //       }
-        //     }
-        //   }
-        // }
-
+        }
+        #define L(x) " ," #x ": " << x
+ 
+        if(load_node){
+          LOG(INFO) << "==================";
+          LOG(INFO) << L(store->buffer);
+          LOG(INFO) << L(store->indices); // ,store->indices: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->value); // B[bx * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->predicate);
+          LOG(INFO) << L(store->span);
+          LOG(INFO) << L(layout_map_[buffer]->GetForwardIndex()); 
+          // [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
+          // [1, 32, 512]
+          auto new_indices = layout_map_[buffer]->Forward(store->indices);
+          LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+          LOG(INFO) << "------------------";
+        }
         if (load_node) {
-          // Use the flatten-space delta approach:
-          // 1. layout->Forward does reshape + swizzle (may change dims,
-          //    e.g. 2D → 3D).
-          // 2. Flatten both the swizzled physical indices and the original
-          //    logical indices into 1D offsets. The reshape terms cancel,
-          //    leaving flat_delta = swizzle(col) - col.
-          // 3. Subtract flat_delta from the last dim of the swizzled store
-          //    indices → sequential store (reshape only, no swizzle).
-          // 4. Add flat_delta to the last dim of the global load indices
-          //    → swizzle moves to the read side.
+          // For gfx950 buffer_load_lds: move swizzle from shared store
+          // to global load so LDS addresses are contiguous per thread.
+          //
+          // Original:  shared[Forward(local)] = global[base + local]
+          // Rewritten: shared[Forward_no_xor(local)] = global[base + Swizzle(local)]
+          //
+          // The XOR swizzle delta is provided by the layout itself via
+          // SwizzleDelta(). It only affects the last input dimension.
+          // XOR is self-inverse: applying delta twice returns to original.
 
-          // A_s[row, col] -> A_s[swizzled_row, swizzled_col]
-          auto swizzled_store = layout->Forward(store->indices); 
+          auto swizzled_store = layout_map_[buffer]->Forward(store->indices);
+          PrimExpr delta = analyzer_->Simplify(
+              layout_map_[buffer]->SwizzleDelta(store->indices));
 
-          // Flatten swizzled physical indices using new_buffer shape.
-          PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = swizzled_store.size() - 1; k >= 0; --k) {
-              flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
-              stride = stride * new_buffer->shape[k];
-            }
+          // Store: Forward(store_idx) with XOR removed from last output dim.
+          int last_out = swizzled_store.size() - 1;
+          Array<PrimExpr> sequential_store(swizzled_store.begin(), swizzled_store.end());
+          sequential_store.Set(last_out, analyzer_->Simplify(
+              swizzled_store[last_out] - delta));
+
+          // Load: apply XOR delta to the last input dim.
+          int last_in = store->indices.size() - 1;
+          Array<PrimExpr> reflected(store->indices.begin(), store->indices.end());
+          reflected.Set(last_in, analyzer_->Simplify(
+              store->indices[last_in] + delta));
+
+          // New global load: base + reflected
+          // where base = load_idx - store_idx (the global tile offset).
+          ICHECK_EQ(load_node->indices.size(), store->indices.size());
+          Array<PrimExpr> new_load_indices;
+          for (size_t k = 0; k < load_node->indices.size(); k++) {
+            PrimExpr base = analyzer_->Simplify(
+                load_node->indices[k] - store->indices[k]);
+            new_load_indices.push_back(analyzer_->Simplify(
+                base + reflected[k]));
           }
-
-          // Flatten original logical indices using original buffer shape.
-          PrimExpr flat_original = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = store->indices.size() - 1; k >= 0; --k) {
-              flat_original = flat_original + store->indices[k] * stride;
-              stride = stride * buffer->shape[k];
-            }
-          }
-
-          // 这个也就是解出来 flatten 空间中 swizzle 和 original 的插值了吧.
-          PrimExpr flat_delta = analyzer_->Simplify(flat_swizzled - flat_original);
-
-          // share_store: remove swizzle from the last dimension.
-          int last_s = swizzled_store.size() - 1;
-          swizzled_store.Set(last_s, analyzer_->Simplify(swizzled_store[last_s] - flat_delta));
-
-          // global_load: add swizzle to the last dimension of global indices.
-          Array<PrimExpr> new_load_indices(load_node->indices.begin(), load_node->indices.end());
-          int last_l = new_load_indices.size() - 1;
-          new_load_indices.Set(last_l, analyzer_->Simplify(load_node->indices[last_l] + flat_delta));
 
           auto global_load = BufferLoad(load_node->buffer, new_load_indices);
-
-          // TODO: not need it here.
-          // // if_then_else).
-          // PrimExpr new_value;
-          // if (auto *cast = store_value.as<CastNode>()) {
-          //   new_value = Cast(cast->dtype, new_load);
-          // } else if (auto *call = store_value.as<CallNode>()) {
-          //   // if_then_else(pred, new_load, else_value)
-          //   Array<PrimExpr> new_args = {call->args[0], new_load,
-          //                               call->args[2]};
-          //   new_value = Call(call->dtype, call->op, new_args);
-          // } else {
-          //   new_value = new_load;
-          // }
-
-          return BufferStore(new_buffer, global_load, swizzled_store);
+          return BufferStore(new_buffer, global_load, sequential_store);
         }
       }
 
-      // Default path: apply swizzle to store indices (original behavior).
-      auto new_indices = layout->Forward(store->indices);
+      auto new_indices = layout_map_[buffer]->Forward(store->indices);
       return BufferStore(new_buffer, store->value, new_indices);
     } else if (var_remap_.count(buffer->data)) {
       auto new_buffer = Buffer(

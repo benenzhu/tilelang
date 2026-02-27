@@ -17,7 +17,7 @@ from tilelang.utils.target import target_is_volta
 
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
 def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range):
-    thread_nums = thread_bounds.extent # 512
+    thread_nums = thread_bounds.extent
     return gemm_py.infer_layout(target, thread_nums) # target: hip,  max_num_threads 不对， max_shared_memory_per_block 不对 
 
 

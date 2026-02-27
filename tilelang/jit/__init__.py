@@ -435,12 +435,10 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             self.func.set_mode(self.mode)
 
         key, kernel_args = self.func.parse_args(*args, **kwargs)
-        print(f"key: {key}")
         kernel = self._kernel_cache.get(key, None)
         if kernel is None:
             kernel = self.compile(*args, **kwargs)
             self._kernel_cache[key] = kernel
-            print("kernel", kernel)
 
         # eager mode: execute kernel immediately and return result
         # lazy mode: return kernel object for manual invocation
