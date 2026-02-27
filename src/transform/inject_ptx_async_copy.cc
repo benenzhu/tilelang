@@ -32,13 +32,71 @@
 #include "tir/ir/buffer_common.h"
 #include "tvm/tir/stmt.h"
 
+#include "../op/builtin.h"
+
 namespace tvm {
 namespace tl {
 
 using namespace tir;
 
+static bool TargetIsRocm(const Target &target) {
+  return target->kind->name == "rocm" || target->kind->name == "hip";
+}
+
+// Check if a flat shared-memory offset expression is truly LINEAR
+// (affine) in the thread variable — i.e. f(tx) = a*tx + b.
+//
+// buffer_load_lds writes to m0 + lane_id * N, requiring strict linearity.
+// A 2D tiling pattern like ((tx & 31) >> 3) * 2048 + (tx & 7) * 8 is NOT
+// linear even though f(1)-f(0) is constant.
+//
+// We check f(k+1)-f(k) == f(1)-f(0) at multiple sample points to catch
+// non-linear patterns (floor-div, bit-extract, modular arithmetic).
+static bool IsLdsContiguous(const PrimExpr &flat_offset) {
+  arith::Analyzer analyzer;
+  std::unordered_set<const VarNode *> seen;
+  Array<Var> free_vars;
+  PostOrderVisit(flat_offset, [&](const ObjectRef &node) {
+    if (auto *v = node.as<VarNode>()) {
+      if (seen.insert(v).second) {
+        free_vars.push_back(Downcast<Var>(node));
+      }
+    }
+  });
+  for (const auto &var : free_vars) {
+    auto name = std::string(var->name_hint);
+    if (name == "tx" || name == "thread_binding" ||
+        name.find("thread") != std::string::npos) {
+      // Check stride at multiple points to detect non-linearity.
+      // Sample at 0, 1, 7, 8, 31, 32, 63 to catch common tile boundaries.
+      static const int sample_points[] = {0, 1, 7, 8, 31, 32, 63};
+      PrimExpr f0 = analyzer.Simplify(Substitute(
+          flat_offset, Map<Var, PrimExpr>{{var, IntImm(var->dtype, 0)}}));
+      PrimExpr f1 = analyzer.Simplify(Substitute(
+          flat_offset, Map<Var, PrimExpr>{{var, IntImm(var->dtype, 1)}}));
+      PrimExpr expected_stride = analyzer.Simplify(f1 - f0);
+      auto *stride_imm = expected_stride.as<IntImmNode>();
+      if (!stride_imm) return false;
+
+      for (int pt : sample_points) {
+        if (pt == 0) continue;
+        PrimExpr fk = analyzer.Simplify(Substitute(
+            flat_offset, Map<Var, PrimExpr>{{var, IntImm(var->dtype, pt)}}));
+        PrimExpr actual = analyzer.Simplify(fk - f0);
+        PrimExpr expected = IntImm(DataType::Int(32), stride_imm->value * pt);
+        if (!analyzer.CanProveEqual(actual, expected)) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 class PTXAsyncCopyInjector : public StmtMutator {
 public:
+  explicit PTXAsyncCopyInjector(bool is_rocm) : is_rocm_(is_rocm) {}
   Stmt VisitStmt_(const AttrStmtNode *attr) {
     if (attr->attr_key == tir::attr::async_scope) {
       ICHECK(in_async == false) << "Nested async scopes not supported";
@@ -109,16 +167,18 @@ public:
 
           ffi::Array<PrimExpr> cp_async_args;
           if (predicated) {
-            // Predicated cp.async with 4 arguments
             cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(bytes),
                              predicate_value};
           } else {
-            // Non-predicated cp.async with 3 arguments
             cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(bytes)};
           }
-          return Evaluate(Call(store->buffer->dtype,
-                               tvm::tir::builtin::ptx_cp_async(),
-                               cp_async_args));
+          // On ROCm, use buffer_load...lds when LDS is lane-contiguous.
+          bool lds_contiguous = is_rocm_ && !predicated && bytes == 16 &&
+                                IsLdsContiguous(dst_offset);
+          const Op &op = lds_contiguous
+                             ? tl::ptx_cp_async_lds()
+                             : tvm::tir::builtin::ptx_cp_async();
+          return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
         }
 
         // Predicated load don't support vectorized indexing.
@@ -164,9 +224,12 @@ public:
 
             ffi::Array<PrimExpr> cp_async_args{dst_access_ptr, src_access_ptr,
                                                PrimExpr(bytes)};
-            return Evaluate(Call(store->buffer->dtype,
-                                 tvm::tir::builtin::ptx_cp_async(),
-                                 cp_async_args));
+            bool lds_contiguous_vec = is_rocm_ && bytes == 16 &&
+                                     IsLdsContiguous(dst_offset);
+            const Op &op = lds_contiguous_vec
+                               ? tl::ptx_cp_async_lds()
+                               : tvm::tir::builtin::ptx_cp_async();
+            return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
           }
         } else {
           // Predicated vectorized cp.async - extract offsets from vectorized
@@ -267,14 +330,26 @@ public:
 
 private:
   bool in_async{false};
+  bool is_rocm_{false};
 };
 
 using namespace tir::transform;
 
 tvm::transform::Pass InjectPTXAsyncCopy() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    bool is_rocm = false;
+    if (target.defined()) {
+      is_rocm = TargetIsRocm(target.value());
+    } else {
+      // Fallback: check Target::Current()
+      auto current = Target::Current();
+      if (current.defined()) {
+        is_rocm = TargetIsRocm(current);
+      }
+    }
     auto *n = f.CopyOnWrite();
-    n->body = PTXAsyncCopyInjector()(n->body);
+    n->body = PTXAsyncCopyInjector(is_rocm)(n->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectPTXAsyncCopy", {});

@@ -767,7 +767,8 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ");\n";
   };
   if (op->op.same_as(builtin::ptx_cp_async()) ||
-      op->op.same_as(tl::ptx_cp_async())) {
+      op->op.same_as(tl::ptx_cp_async()) ||
+      op->op.same_as(tl::ptx_cp_async_lds())) {
     // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
     // args[3] = predicate (optional)
     ICHECK(op->args.size() == 3 || op->args.size() == 4)
@@ -779,8 +780,9 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     if (op->args.size() == 3) {
       // Non-predicated version
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
-                   << ");\n";
+      bool use_lds = op->op.same_as(tl::ptx_cp_async_lds());
+      this->stream << (use_lds ? "tl::cp_async_gs_lds<" : "tl::cp_async_gs<")
+                   << size << ">(" << dst << ", " << src << ");\n";
     } else {
       // Predicated version
       std::string condition = this->PrintExpr(op->args[3]);

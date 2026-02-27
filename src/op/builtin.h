@@ -379,6 +379,17 @@ TVM_DLL const Op &ptx_cp_async_barrier_noinc();
 TVM_DLL const Op &ptx_cp_async();
 
 /*!
+ * \brief Truly async G2S copy via buffer_load_b128...lds (gfx950+).
+ *
+ * Same signature as ptx_cp_async but emits cp_async_gs_lds<N>
+ * which uses the hardware buffer_load...lds instruction.
+ * Only valid when LDS addresses are lane-contiguous (swizzle-swap applied).
+ *
+ * ptx_cp_async_lds(dst_access_ptr, src_access_ptr, bytes)
+ */
+TVM_DLL const Op &ptx_cp_async_lds();
+
+/*!
  * \brief Pack two b16 value into a b32 value
  *
  * int32 pack_b16(b16_value, b16_value)
