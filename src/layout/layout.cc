@@ -105,6 +105,9 @@ Array<PrimExpr> LayoutNode::OutputShape() const {
   UpdateAnalyzer(&analyzer);
   for (size_t i = 0; i < ret.size(); i++) {
     auto ist = analyzer.int_set(forward_index_[i] + 1);
+    #define L(x) "," #x ": " << x
+    // LOG(INFO) << L(forward_index_[i] + 1);
+    // LOG(INFO) << L(ist);
     if (arith::is_neg_inf(ist.min()) && arith::is_pos_inf(ist.max())) {
       // Analyzer couldn't form an IntervalSet (e.g. bitwise ops).
       // Fall back to ConstIntBound to derive a safe extent.
@@ -134,7 +137,9 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   if (vars.empty())
     return forward_index_;
   ICHECK_GE(vars.size(), InputDim());
-
+  #define L(x) ", " #x ": " << x
+  // LOG(INFO) << L(vars); // vars: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+  // LOG(INFO) << L(forward_index_); // forward_index_: [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
   // Take the last InputDim() elements for transformation
   Array<PrimExpr> transform_vars;
   for (size_t i = vars.size() - InputDim(); i < vars.size(); i++) {
@@ -156,8 +161,25 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   for (const auto &expr : transformed) {
     result.push_back(expr);
   }
+  // LOG(INFO) << L(result); // result: [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
 
   return result;
+}
+
+PrimExpr LayoutNode::SwizzleDelta(const Array<PrimExpr> &input_indices) const {
+  if (!swizzle_delta_.defined()) {
+    return IntImm(DataType::Int(32), 0);
+  }
+  // Substitute the last InputDim() elements of input_indices
+  // into the swizzle_delta_ expression (same convention as Forward).
+  PrimExpr delta = swizzle_delta_.value();
+  size_t offset = input_indices.size() >= InputDim()
+                      ? input_indices.size() - InputDim()
+                      : 0;
+  for (size_t i = 0; i < InputDim(); i++) {
+    delta = Substitute(delta, {{InputPlaceholder(i), input_indices[offset + i]}});
+  }
+  return delta;
 }
 
 Layout LayoutNode::Repeat(int dim, int factor) const {
@@ -239,7 +261,13 @@ Layout LayoutNode::Expand(const Array<PrimExpr> &leading_shape) const {
     new_forward_index.push_back(Substitute(e, vmap));
   }
 
-  return Layout(new_input_size, new_forward_index);
+  Layout result(new_input_size, new_forward_index);
+  // Propagate swizzle_delta_: shift placeholder indices by offset.
+  if (swizzle_delta_.defined()) {
+    const_cast<LayoutNode *>(result.get())->SetSwizzleDelta(
+        Substitute(swizzle_delta_.value(), vmap));
+  }
+  return result;
 }
 
 Fragment FragmentNode::Repeat(const Array<PrimExpr> &repeats,
@@ -466,7 +494,22 @@ Layout LayoutNode::Reshape(const Array<PrimExpr> &shape,
     new_forward_index =
         Substitute(new_forward_index, {{new_vars[i], InputPlaceholder(i)}});
   }
-  return Layout(shape, new_forward_index);
+  Layout result(shape, new_forward_index);
+  // Propagate swizzle_delta_ through reshape.
+  if (swizzle_delta_.defined()) {
+    PrimExpr new_delta = swizzle_delta_.value();
+    for (size_t i = 0; i < InputShape().size(); ++i) {
+      new_delta =
+          Substitute(new_delta, {{InputPlaceholder(i), original_indices[i]}});
+    }
+    new_delta = az->Simplify(new_delta);
+    for (size_t i = 0; i < new_vars.size(); ++i) {
+      new_delta =
+          Substitute(new_delta, {{new_vars[i], InputPlaceholder(i)}});
+    }
+    const_cast<LayoutNode *>(result.get())->SetSwizzleDelta(new_delta);
+  }
+  return result;
 }
 
 Layout FragmentNode::Reshape(const Array<PrimExpr> &shape,

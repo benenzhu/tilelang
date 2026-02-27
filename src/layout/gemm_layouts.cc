@@ -432,7 +432,10 @@ static Layout MakeQuarterBankSwizzleLayout2D(int stride, int continuous,
   PrimExpr vec = FloorMod(j, vector_size);
   PrimExpr c_swizzle = xor2x2(c, FloorDiv(s, 4));
   PrimExpr index = vec + (c_swizzle + s * 2) * vector_size;
-  return Layout(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  PrimExpr swizzle_delta = (c_swizzle - c) * vector_size;
+  Layout result(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  const_cast<LayoutNode *>(result.get())->SetSwizzleDelta(swizzle_delta);
+  return result;
 }
 
 Layout makeQuarterBankSwizzleLayout(const Buffer &buffer) {
@@ -465,7 +468,10 @@ static Layout MakeHalfBankSwizzleLayout2D(int stride, int continuous,
   PrimExpr vec = FloorMod(j, vector_size);
   PrimExpr c_swizzle = xor4x4(c, FloorDiv(s, 2));
   PrimExpr index = vec + (c_swizzle + s * 4) * vector_size;
-  return Layout(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  PrimExpr swizzle_delta = (c_swizzle - c) * vector_size;
+  Layout result(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  const_cast<LayoutNode *>(result.get())->SetSwizzleDelta(swizzle_delta);
+  return result;
 }
 
 Layout makeHalfBankSwizzleLayout(const Buffer &buffer) {
@@ -482,26 +488,26 @@ Layout makeHalfBankSwizzleLayout(const Buffer &buffer) {
 }
 
 // Layout swizzling for 128 bytes
-
+static Layout MakeFullBankSwizzleLayout2D(int stride, int continuous,
+                                          int element_size) {
   // Swizzle 3 bit
-  LOG(INFO) << "full bank swizzle layout";
   Var i = InputPlaceholder(0);
   Var j = InputPlaceholder(1);
-  int vector_size = 128 / element_size; // 8
-  ICHECK(stride % 8 == 0) << "stride=" << stride;
-  ICHECK(continuous % (vector_size * 8) == 0)
+  int vector_size = 128 / element_size; // ele_size = 16, vector_size = 8, 8 ele here.
+  ICHECK(stride % 8 == 0) << "stride=" << stride; // stride = 256
+  ICHECK(continuous % (vector_size * 8) == 0) // continuous = 256.
       << "continuous=" << continuous << ", vector_size=" << vector_size;
-  PrimExpr ts = FloorDiv(i, 8);
-  PrimExpr s = FloorMod(i, 8);
-  PrimExpr tc = FloorDiv(FloorDiv(j, vector_size), 8);
-  PrimExpr c = FloorMod(FloorDiv(j, vector_size), 8);
-  PrimExpr vec = FloorMod(j, vector_size);
-  PrimExpr c_swizzle = xor8x8(c, s);
-  PrimExpr index = vec + (c_swizzle + s * 8) * vector_size;
-  LOG(INFO) << "tc:" << tc;
-  LOG(INFO) << "ts:" << ts;
-  LOG(INFO) << "index:" << index;
-  return Layout(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  PrimExpr ts = FloorDiv(i, 8); // _i / 8 -> range [0,32]
+  PrimExpr s = FloorMod(i, 8); // _i % 8 -> range [0,8]
+  PrimExpr tc = FloorDiv(FloorDiv(j, vector_size), 8); // (_j/8)/8 -> range [0,1] = 0
+  PrimExpr c = FloorMod(FloorDiv(j, vector_size), 8); // (_j/8)%8 -> range [0,1]
+  PrimExpr vec = FloorMod(j, vector_size); // range [0,8]
+  PrimExpr c_swizzle = xor8x8(c, s); // XOR swizzle
+  PrimExpr index = vec + (c_swizzle + s * 8) * vector_size; // range [0,512]
+  PrimExpr swizzle_delta = (c_swizzle - c) * vector_size;
+  Layout result(Array<PrimExpr>{stride, continuous}, {tc, ts, index});
+  const_cast<LayoutNode *>(result.get())->SetSwizzleDelta(swizzle_delta);
+  return result;
 }
 
 Layout makeFullBankSwizzleLayout(const Buffer &buffer) {
@@ -812,7 +818,6 @@ Layout makeGemmSparseAmpereABLayout(int mat_stride, int mat_continuous,
  */
 Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
                         int element_size, bool k_inner) {
-  LOG(INFO) << "mat_stride:" << mat_stride << ", mat_continuous:" << mat_continuous << ", continuity:" << continuity << ", element_size:" << element_size << ", k_inner:" << k_inner;
   if (element_size == 64) {
     if (!k_inner && continuity % 16 == 0) // float64 KxN
       return makeGemmABLayoutF64_Kouter(mat_stride, mat_continuous);
@@ -820,7 +825,7 @@ Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
       return makeGemmABLayoutF64_Kinner(mat_stride, mat_continuous);
     return makeGemmABLayoutPadded(mat_stride, mat_continuous, element_size);
   }
-  int vector_size = 128 / element_size; // 128/ 16 = 8
+  int vector_size = 128 / element_size;
   if (!k_inner && element_size == 8) // int8 KxN
     return makeGemmABLayoutPadded(mat_stride, mat_continuous, element_size);
   else if (mat_continuous % (vector_size * 8) == 0)

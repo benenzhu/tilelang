@@ -42,8 +42,6 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTG, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTGPredicated, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableLoopUnswitching, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLoopUnswitchingAllowNonTrivialElse, Bool);
-TVM_REGISTER_PASS_CONFIG_OPTION(kInterleaveG2S, Bool);
-TVM_REGISTER_PASS_CONFIG_OPTION(kScatteredWarpLayout, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableOutOfBoundWarning, Bool);
 
 DataType cuTensorMapType() { return DataType::UInt(8, 128); }

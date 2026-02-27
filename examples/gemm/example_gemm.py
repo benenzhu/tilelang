@@ -1,7 +1,8 @@
 import os
+
 os.system("rm *.s")
 os.system('find ~/.tilelang/ -name "*.so" -print -delete')
-os.environ["TL_DISABLE_G2S_HOIST"]="1"
+os.environ["TL_DISABLE_G2S_HOIST"] = "1"
 import tilelang
 import tilelang.language as T
 
@@ -33,15 +34,17 @@ import tilelang.language as T
 #     return gemm
 
 
-
-@tilelang.jit(out_idx=[-1], pass_configs={
-    tilelang.PassConfigKey.TL_SCATTERED_WARP_LAYOUT: True,
-    # tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
-})
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        # tilelang.PassConfigKey.TL_SCATTERED_WARP_LAYOUT: True,
+        # tilelang.PassConfigKey.TL_INTERLEAVE_G2S: True,
+    },
+)
 def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=T.float32):
     @T.prim_func
     def gemm(
-        A: T.Tensor((M, K), dtype), 
+        A: T.Tensor((M, K), dtype),
         B: T.Tensor((N, K), dtype),
         C: T.Tensor((M, N), dtype),
     ):
@@ -53,20 +56,21 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
 
             # Enable rasterization for better L2 cache locality
             # num_xcds=8 for MI300X XCD remap (set to 0 or omit on CUDA)
-            T.use_swizzle(panel_size=4, num_xcds=8)
+            T.use_swizzle(panel_size=4, use_amd_remap=True)
 
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_shared)
                 T.gemm_v2(A_shared, B_shared, C_local, transpose_B=True, k_pack=2)
-            
+
             T.copy(C_local, C[by * block_M, bx * block_N])
-    
+
     return gemm
-    
+
 
 ### TODO(zty): 1. add a new kernel for NT layout? or just transpose B and continues can do?
+
 
 def main(transpose_b=False):
     M, N, K = 8192, 8192, 8192
@@ -94,12 +98,11 @@ def main(transpose_b=False):
         print("execute kernel", flush=True)
         torch.cuda.synchronize()
 
-        import time
         # time.sleep(1)
         print("execute kernel done", flush=True)
         ref_c = a @ b_nt.T
 
-    for zz in range(5): 
+    for zz in range(5):
         if not transpose_b:
             c = kernel(a, b)
         else:
