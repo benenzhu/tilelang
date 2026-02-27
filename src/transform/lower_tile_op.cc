@@ -935,23 +935,24 @@ private:
           // gets global[base + Swizzle(Swizzle(c))] = global[base + c]. ✓
 
           auto swizzled_store = layout_map_[buffer]->Forward(store->indices);
+          LOG(INFO) << swizzled_store;
 
           // Flatten swizzled physical indices → flat_swizzled.
-          PrimExpr flat_swizzled = IntImm(DataType::Int(32), 0);
+          PrimExpr flat_swizzled_shared_mem = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
             for (int k = (int)swizzled_store.size() - 1; k >= 0; --k) {
-              flat_swizzled = flat_swizzled + swizzled_store[k] * stride;
+              flat_swizzled_shared_mem = flat_swizzled_shared_mem + swizzled_store[k] * stride;
               stride = stride * new_buffer->shape[k];
             }
           }
 
           // Flatten original logical indices → flat_original.
-          PrimExpr flat_original = IntImm(DataType::Int(32), 0);
+          PrimExpr flat_original_shared_mem = IntImm(DataType::Int(32), 0);
           {
             PrimExpr stride = IntImm(DataType::Int(32), 1);
             for (int k = (int)store->indices.size() - 1; k >= 0; --k) {
-              flat_original = flat_original + store->indices[k] * stride;
+              flat_original_shared_mem = flat_original_shared_mem + store->indices[k] * stride;
               stride = stride * buffer->shape[k];
             }
           }
@@ -988,7 +989,7 @@ private:
             }
             return have_one == true;
           };
-          check_continue(flat_original);
+          check_continue(flat_original_shared_mem);
 
           LOG(INFO) << L(buffer) << L(buffer->shape);
           LOG(INFO) << L(new_buffer) << L(new_buffer->shape);
@@ -999,7 +1000,7 @@ private:
           Array<PrimExpr> sequential_store;
           sequential_store.resize(new_buffer->shape.size());
           {
-            PrimExpr remaining = flat_original;
+            PrimExpr remaining = flat_original_shared_mem;
             for (int k = (int)new_buffer->shape.size() - 1; k >= 0; --k) {
               sequential_store.Set(k, analyzer_->Simplify(
                   FloorMod(remaining, new_buffer->shape[k])));
@@ -1046,7 +1047,7 @@ private:
           Array<PrimExpr> swizzled_local;
           swizzled_local.resize(buffer->shape.size());
           {
-            PrimExpr remaining = analyzer_->Simplify(flat_swizzled);
+            PrimExpr remaining = analyzer_->Simplify(flat_swizzled_shared_mem);
             for (int k = (int)buffer->shape.size() - 1; k >= 0; --k) {
               swizzled_local.Set(k, analyzer_->Simplify(
                   FloorMod(remaining, buffer->shape[k])));
@@ -1060,16 +1061,23 @@ private:
           ICHECK_EQ(load_node->indices.size(), store->indices.size())
               << "Load and store must have the same number of dimensions";
           Array<PrimExpr> new_load_indices;
+          LOG(INFO) << "===============";
+          LOG(INFO) << L(load_node->indices);
+          LOG(INFO) << L(load_node->predicate);
+          LOG(INFO) << L(load_node->buffer); // the gmem
+          LOG(INFO) << L(store->indices);
+          LOG(INFO) << L(store);
+          LOG(INFO) << "---------------";
           for (size_t k = 0; k < load_node->indices.size(); k++) {
             PrimExpr base = analyzer_->Simplify(
-                load_node->indices[k] - store->indices[k]);
+                load_node->indices[k] - store->indices[k]); // gmem - shared_mem
             LOG(INFO) << "dim " << k << ":"
                       << " load=" << load_node->indices[k]
                       << " store=" << store->indices[k]
                       << " base=" << base
                       << " swizzled_local=" << swizzled_local[k];
             new_load_indices.push_back(analyzer_->Simplify(
-                base + swizzled_local[k]));
+                base + swizzled_local[k])); // gmem - shared_mem + swizzled_local
           }
           LOG(INFO) << "new_load:" << L(new_load_indices);
 
