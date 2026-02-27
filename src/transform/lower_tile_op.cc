@@ -910,6 +910,22 @@ private:
             load_node = load;
           }
         }
+        #define L(x) " ," #x ": " << x
+ 
+        if(load_node){
+          LOG(INFO) << "==================";
+          LOG(INFO) << L(store->buffer);
+          LOG(INFO) << L(store->indices); // ,store->indices: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->value); // B[bx * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
+          LOG(INFO) << L(store->predicate);
+          LOG(INFO) << L(store->span);
+          LOG(INFO) << L(layout_map_[buffer]->GetForwardIndex()); 
+          // [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
+          // [1, 32, 512]
+          auto new_indices = layout_map_[buffer]->Forward(store->indices);
+          LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
+          LOG(INFO) << "------------------";
+        }
         if (load_node) {
           // For gfx950 buffer_load_lds: move swizzle from shared store
           // to global load so LDS addresses are contiguous per thread.
