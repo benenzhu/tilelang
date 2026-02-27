@@ -67,7 +67,6 @@ def make_swizzled_layout(buffer: BufferLikeType, k_major: bool = True, allow_pad
     _, shape, _ = _get_buffer_info(buffer)
     stride, continuous = _get_stride_continuous(buffer)
     element_size = _get_element_size(buffer)
-    print(__file__, "buffer:", buffer, "shape:", shape, "stride:", stride, "continuous:", continuous, "element_size:", element_size, "k_major:", k_major, "allow_pad:", allow_pad)
     base = _ffi_api.make_swizzled_layout(
         stride,
         continuous,
