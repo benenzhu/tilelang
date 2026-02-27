@@ -100,6 +100,26 @@ public:
 
   virtual bool IsEqual(const LayoutNode *other, bool skip_index = false) const;
 
+  /*!
+   * \brief Get the XOR swizzle delta on the last input/output dimension.
+   *
+   * For swizzle layouts (quarter/half/full bank), returns the column delta
+   * caused by the XOR: delta = (c_xor - c) * vec_size. The delta is the
+   * same value in both input and output space.
+   *
+   * For non-swizzle layouts, returns 0.
+   *
+   * \param input_indices The logical input indices (last InputDim() used).
+   * \return The swizzle delta expression.
+   */
+  virtual PrimExpr SwizzleDelta(const Array<PrimExpr> &input_indices) const;
+
+  /*! \brief Whether this layout has a non-trivial swizzle. */
+  bool HasSwizzle() const { return swizzle_delta_.defined(); }
+
+  /*! \brief Set the swizzle delta expression. Called by layout factories. */
+  void SetSwizzleDelta(PrimExpr delta) { swizzle_delta_ = delta; }
+
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", LayoutNode, Object);
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
@@ -110,6 +130,9 @@ protected:
   void UpdateAnalyzer(arith::Analyzer *analyzer) const;
   Array<PrimExpr> forward_index_;
   Array<PrimExpr> input_size_;
+  /*! \brief Optional XOR swizzle delta expression in terms of InputPlaceholders.
+   *  Set by swizzle layout factories. Propagated through Reshape/Expand. */
+  Optional<PrimExpr> swizzle_delta_;
 };
 
 /*!

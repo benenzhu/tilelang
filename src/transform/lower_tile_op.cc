@@ -894,7 +894,15 @@ private:
       layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
       // For ROCm with SwizzledLayout: move swizzle from shared store
       // to global load, making LDS addresses contiguous per thread.
-      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer)) {
+      // For ROCm g2s with swizzled layout: move swizzle from shared store
+      // to global load, making LDS addresses contiguous per thread.
+      // Only applies when:
+      //   1. Target is ROCm
+      //   2. Store is to shared memory
+      //   3. Value is a global load (g2s copy)
+      //   4. Layout has XOR swizzle (HasSwizzle() == true)
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer) &&
+          layout_map_[buffer]->HasSwizzle()) {
         const BufferLoadNode *load_node = nullptr;
         PrimExpr store_value = store->value;
         if (auto *load = store_value.as<BufferLoadNode>()) {
@@ -902,196 +910,45 @@ private:
             load_node = load;
           }
         }
-        #define L(x) " ," #x ": " << x
- 
-        if(load_node){
-          LOG(INFO) << "==================";
-          LOG(INFO) << L(store->buffer);
-          LOG(INFO) << L(store->indices); // ,store->indices: [(i * 8 + vec) // 8 * 64 + tx // 8, tx % 8 * 8 + (i * 8 + vec) % 8]
-          LOG(INFO) << L(store->value); // B[bx * 256 + (i * 8 + vec) // 8 * 64 + tx // 8, k * 64 + tx % 8 * 8 + (i * 8 + vec) % 8]
-          LOG(INFO) << L(store->predicate);
-          LOG(INFO) << L(store->span);
-          LOG(INFO) << L(layout_map_[buffer]->GetForwardIndex()); 
-          // [0, _i // 8, _i % 8 * 64 + (_j // 32 + _i % 8 // 4) % 2 * 32 + (_j % 32 // 16 + _i % 4 // 2) % 2 * 16 + (_j % 16 // 8 + _i % 2) % 2 * 8 + _j % 8]
-          // [1, 32, 512]
-          auto new_indices = layout_map_[buffer]->Forward(store->indices);
-          LOG(INFO) << L(new_indices); // [0, ((i * 8 + vec) // 8 * 64 + tx // 8) // 8, ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 * 64 + ((tx % 8 * 8 + (i * 8 + vec) % 8) // 32 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 8 // 4) % 2 * 32 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 32 // 16 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 4 // 2) % 2 * 16 + ((tx % 8 * 8 + (i * 8 + vec) % 8) % 16 // 8 + ((i * 8 + vec) // 8 * 64 + tx // 8) % 2) % 2 * 8 + (tx % 8 * 8 + (i * 8 + vec) % 8) % 8]
-          LOG(INFO) << "------------------";
-        }
         if (load_node) {
           // For gfx950 buffer_load_lds: move swizzle from shared store
           // to global load so LDS addresses are contiguous per thread.
           //
           // Original:  shared[Forward(local)] = global[base + local]
-          // Rewritten: shared[Reshape(local)] = global[base + Swizzle(local)]
+          // Rewritten: shared[Forward_no_xor(local)] = global[base + Swizzle(local)]
           //
-          // where Reshape = Forward without swizzle (just shape change)
-          //       Swizzle(local) = decompose(flat_swizzled, buffer->shape)
-          //       base = load_idx - store_idx  (global offset, e.g. by*256)
-          //
-          // Correctness: XOR swizzle is an involution. Consumer reads
-          // shared[Forward(c)] = shared[Swizzle(Reshape(c))]. Since we
-          // stored at Reshape(local), the consumer at Swizzle(Reshape(c))
-          // gets global[base + Swizzle(Swizzle(c))] = global[base + c]. ✓
+          // The XOR swizzle delta is provided by the layout itself via
+          // SwizzleDelta(). It only affects the last input dimension.
+          // XOR is self-inverse: applying delta twice returns to original.
 
           auto swizzled_store = layout_map_[buffer]->Forward(store->indices);
-          LOG(INFO) << swizzled_store;
+          PrimExpr delta = analyzer_->Simplify(
+              layout_map_[buffer]->SwizzleDelta(store->indices));
 
-          // Flatten swizzled physical indices → flat_swizzled.
-          PrimExpr flat_swizzled_shared_mem = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = (int)swizzled_store.size() - 1; k >= 0; --k) {
-              flat_swizzled_shared_mem = flat_swizzled_shared_mem + swizzled_store[k] * stride;
-              stride = stride * new_buffer->shape[k];
-            }
-          }
+          // Store: Forward(store_idx) with XOR removed from last output dim.
+          int last_out = swizzled_store.size() - 1;
+          Array<PrimExpr> sequential_store(swizzled_store.begin(), swizzled_store.end());
+          sequential_store.Set(last_out, analyzer_->Simplify(
+              swizzled_store[last_out] - delta));
 
-          // Flatten original logical indices → flat_original.
-          PrimExpr flat_original_shared_mem = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = (int)store->indices.size() - 1; k >= 0; --k) {
-              flat_original_shared_mem = flat_original_shared_mem + store->indices[k] * stride;
-              stride = stride * buffer->shape[k];
-            }
-          }
+          // Load: apply XOR delta to the last input dim.
+          int last_in = store->indices.size() - 1;
+          Array<PrimExpr> reflected(store->indices.begin(), store->indices.end());
+          reflected.Set(last_in, analyzer_->Simplify(
+              store->indices[last_in] + delta));
 
-          // Verify contiguity: flat_original must have constant stride
-          // in every free variable (→ contiguous LDS access pattern).
-          // For thread var tx the stride equals vector_size (e.g. 8).
-          auto check_continue =[this](PrimExpr expr_in){
-            std::unordered_set<const VarNode *> seen;
-            Array<Var> free_vars;
-            PostOrderVisit(expr_in, [&](const ObjectRef &node) {
-              if (auto *v = node.as<VarNode>()) {
-                if (seen.insert(v).second) {
-                  free_vars.push_back(Downcast<Var>(node));
-                }
-              }
-            });
-            bool have_one = false; 
-            for (const auto &var : free_vars) {
-              PrimExpr flat_at_0 = tir::Substitute(expr_in,
-                                                   Map<Var, PrimExpr>{{var, IntImm(var->dtype, 0)}});
-              PrimExpr flat_at_1 = tir::Substitute(expr_in,
-                                                   Map<Var, PrimExpr>{{var, IntImm(var->dtype, 1)}});
-              PrimExpr diff = analyzer_->Simplify(flat_at_1 - flat_at_0);
-              LOG(INFO) << L(var->span) << L(var) << L(var->dtype);
-              if((std::string(var->name_hint) == "tx") ||std::string(var->name_hint) == "thread_binding"){
-                have_one = true;
-                LOG(INFO) << "contiguity: var=" << var << "  stride=" << diff;
-                ICHECK(diff.as<IntImmNode>())
-                    << "LDS store address is not contiguous in variable "
-                    << var << ": stride=" << diff << " (expected constant)";
-              }
-              // ICHECK(have_one == true) << "should";
-            }
-            return have_one == true;
-          };
-          check_continue(flat_original_shared_mem);
-
-          LOG(INFO) << L(buffer) << L(buffer->shape);
-          LOG(INFO) << L(new_buffer) << L(new_buffer->shape);
-          LOG(INFO) << "swizzled:" << L(swizzled_store);
-
-          // Store: decompose flat_original into new_buffer->shape.
-          // Reshape only (no swizzle) → sequential per thread.
-          Array<PrimExpr> sequential_store;
-          sequential_store.resize(new_buffer->shape.size());
-          {
-            PrimExpr remaining = flat_original_shared_mem;
-            for (int k = (int)new_buffer->shape.size() - 1; k >= 0; --k) {
-              sequential_store.Set(k, analyzer_->Simplify(
-                  FloorMod(remaining, new_buffer->shape[k])));
-              remaining = FloorDiv(remaining, new_buffer->shape[k]);
-            }
-          }
-          LOG(INFO) << "sequential:" << L(sequential_store);
-
-          // Load: decompose flat_swizzled into original buffer shape
-          // → swizzled local coordinates in the shared buffer's logical space.
-          // This works because: consumer reads shared[Forward(c)], which in
-          // flat space is shared[Forward_flat(c)]. We stored at shared[flat_orig]
-          // the value global[base + decompose(flat_swizzled, buf_shape)].
-          // Consumer at c finds: Forward_flat(c) == flat_orig iff c == store_idx.
-          // The data at flat_orig is global[base + swizzled_local].
-          //
-          // Correctness requires Forward_flat to be an involution (self-inverse),
-          // which holds when the reshape is trivial (first output dim is constant 0).
-          // When non-trivial reshape exists, fall through to standard Forward path.
-          auto output_shape = layout_map_[buffer]->OutputShape();
-          bool reshape_trivial = true;
-          if (output_shape.size() > buffer->shape.size()) {
-            // Check if the leading extra dimensions are all size 1
-            size_t extra = output_shape.size() - buffer->shape.size();
-            for (size_t d = 0; d < extra; d++) {
-              auto *imm = output_shape[d].as<IntImmNode>();
-              if (!imm || imm->value != 1) {
-                reshape_trivial = false;
-                break;
-              }
-            }
-          }
-          // Also verify involution: Forward_flat(Forward_flat(x)) == x
-          // by checking at a few sample points.
-          if (reshape_trivial) {
-            LOG(INFO) << "Reshape is trivial, applying swizzle-to-load optimization";
-          } else {
-            LOG(INFO) << "Reshape is non-trivial (output_shape=" << output_shape
-                      << "), falling back to standard Forward path";
-            auto new_indices = layout_map_[buffer]->Forward(store->indices);
-            return BufferStore(new_buffer, store->value, new_indices);
-          }
-
-          Array<PrimExpr> swizzled_local;
-          swizzled_local.resize(buffer->shape.size());
-          {
-            PrimExpr remaining = analyzer_->Simplify(flat_swizzled_shared_mem);
-            for (int k = (int)buffer->shape.size() - 1; k >= 0; --k) {
-              swizzled_local.Set(k, analyzer_->Simplify(
-                  FloorMod(remaining, buffer->shape[k])));
-              remaining = FloorDiv(remaining, buffer->shape[k]);
-            }
-          }
-          LOG(INFO) << "swizzled_local:" << L(swizzled_local);
-
-          // New global load: base + swizzled_local
+          // New global load: base + reflected
           // where base = load_idx - store_idx (the global tile offset).
-          ICHECK_EQ(load_node->indices.size(), store->indices.size())
-              << "Load and store must have the same number of dimensions";
+          ICHECK_EQ(load_node->indices.size(), store->indices.size());
           Array<PrimExpr> new_load_indices;
-          LOG(INFO) << "===============";
-          LOG(INFO) << L(load_node->indices);
-          LOG(INFO) << L(load_node->predicate);
-          LOG(INFO) << L(load_node->buffer); // the gmem
-          LOG(INFO) << L(store->indices);
-          LOG(INFO) << L(store);
-          LOG(INFO) << "---------------";
           for (size_t k = 0; k < load_node->indices.size(); k++) {
             PrimExpr base = analyzer_->Simplify(
-                load_node->indices[k] - store->indices[k]); // gmem - shared_mem
-            LOG(INFO) << "dim " << k << ":"
-                      << " load=" << load_node->indices[k]
-                      << " store=" << store->indices[k]
-                      << " base=" << base
-                      << " swizzled_local=" << swizzled_local[k];
+                load_node->indices[k] - store->indices[k]);
             new_load_indices.push_back(analyzer_->Simplify(
-                base + swizzled_local[k])); // gmem - shared_mem + swizzled_local
+                base + reflected[k]));
           }
-          LOG(INFO) << "new_load:" << L(new_load_indices);
 
           auto global_load = BufferLoad(load_node->buffer, new_load_indices);
-          
-          PrimExpr flat_sequential = IntImm(DataType::Int(32), 0);
-          {
-            PrimExpr stride = IntImm(DataType::Int(32), 1);
-            for (int k = (int)sequential_store.size() - 1; k >= 0; --k) {
-              flat_sequential = flat_sequential + sequential_store[k] * stride;
-              stride = stride * new_buffer->shape[k];
-            }
-          }
-          ICHECK(check_continue(flat_sequential)) << "should be continue" << flat_sequential;
           return BufferStore(new_buffer, global_load, sequential_store);
         }
       }
