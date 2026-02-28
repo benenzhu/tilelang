@@ -410,6 +410,7 @@ def run_gemm_sr(
 
     def ref_program(A, B):
         import torch
+        print(A,B)
 
         if trans_A:
             A = A.T

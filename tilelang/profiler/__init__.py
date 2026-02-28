@@ -61,6 +61,7 @@ class Profiler:
     def _get_inputs(self, with_output=False, dynamic_symbolic_constraints: dict[str, int] | None = None):
         ins = []
         for i in range(len(self.params)):
+            print(__file__, "i", i, self.params, flush=True)
             if with_output or i not in self.result_idx:
                 param = self.params[i]
                 if dynamic_symbolic_constraints:
@@ -140,6 +141,8 @@ class Profiler:
         ref_tensors = ins + ref_outs
         lib_tensors = ins + lib_outs
 
+        print(__file__, "lib_tensors", lib_tensors, flush=True)
+        print(__file__, "ref_tensors", ref_tensors, flush=True)
         assert len(lib_tensors) == len(ref_tensors), "len(lib_tensors) not equals to len(ref_tensors) !"
         # torch.set_printoptions(edgeitems=torch.inf)
         for lhs, rhs in zip(lib_tensors, ref_tensors):

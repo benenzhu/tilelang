@@ -89,6 +89,7 @@ def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):
                 )
 
         shape = list(map(int, param.shape))
+        print(__file__, "supply_type", supply_type, flush=True)
         if supply_type == TensorSupplyType.Auto:
             is_unsigned = param.is_unsigned()
             is_float8 = param.is_float8()
@@ -111,8 +112,7 @@ def get_tensor_supply(supply_type: TensorSupplyType = TensorSupplyType.Integer):
             TensorSupplyType.Uniform,
             TensorSupplyType.Normal,
         ]:
-            return torch.ones(*shape, device=device, dtype=dtype)
-
+            return torch.randint(low=-2, high=3, size=shape, device=device, dtype=dtype)
         if supply_type == TensorSupplyType.Integer:
             is_unsigned = param.is_unsigned()
             is_float8 = param.is_float8()
