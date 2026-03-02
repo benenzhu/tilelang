@@ -39,7 +39,7 @@ namespace tl {
 
 using namespace tir;
 
-static bool TargetIsRocm(const Target &target) {
+/* static bool TargetIsRocm(const Target &target) {
   return target->kind->name == "rocm" || target->kind->name == "hip";
 }
 
@@ -92,11 +92,11 @@ static bool IsLdsContiguous(const PrimExpr &flat_offset) {
     }
   }
   return false;
-}
+} */
 
 class PTXAsyncCopyInjector : public StmtMutator {
 public:
-  explicit PTXAsyncCopyInjector(bool is_rocm) : is_rocm_(is_rocm) {}
+  // explicit PTXAsyncCopyInjector(bool is_rocm) : is_rocm_(is_rocm) {}
   Stmt VisitStmt_(const AttrStmtNode *attr) {
     if (attr->attr_key == tir::attr::async_scope) {
       ICHECK(in_async == false) << "Nested async scopes not supported";
@@ -172,13 +172,16 @@ public:
           } else {
             cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(bytes)};
           }
-          // On ROCm, use buffer_load...lds when LDS is lane-contiguous.
-          bool lds_contiguous = is_rocm_ && !predicated && bytes == 16 &&
-                                IsLdsContiguous(dst_offset);
-          const Op &op = lds_contiguous
-                             ? tl::ptx_cp_async_lds()
-                             : tvm::tir::builtin::ptx_cp_async();
-          return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
+          return Evaluate(Call(store->buffer->dtype,
+                               tvm::tir::builtin::ptx_cp_async(),
+                               cp_async_args));
+          // // On ROCm, use buffer_load...lds when LDS is lane-contiguous.
+          // bool lds_contiguous = is_rocm_ && !predicated && bytes == 16 &&
+          //                       IsLdsContiguous(dst_offset);
+          // const Op &op = lds_contiguous
+          //                    ? tl::ptx_cp_async_lds()
+          //                    : tvm::tir::builtin::ptx_cp_async();
+          // return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
         }
 
         // Predicated load don't support vectorized indexing.
@@ -224,12 +227,15 @@ public:
 
             ffi::Array<PrimExpr> cp_async_args{dst_access_ptr, src_access_ptr,
                                                PrimExpr(bytes)};
-            bool lds_contiguous_vec = is_rocm_ && bytes == 16 &&
-                                     IsLdsContiguous(dst_offset);
-            const Op &op = lds_contiguous_vec
-                               ? tl::ptx_cp_async_lds()
-                               : tvm::tir::builtin::ptx_cp_async();
-            return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
+            return Evaluate(Call(store->buffer->dtype,
+                                 tvm::tir::builtin::ptx_cp_async(),
+                                 cp_async_args));
+            // bool lds_contiguous_vec = is_rocm_ && bytes == 16 &&
+            //                          IsLdsContiguous(dst_offset);
+            // const Op &op = lds_contiguous_vec
+            //                    ? tl::ptx_cp_async_lds()
+            //                    : tvm::tir::builtin::ptx_cp_async();
+            // return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
           }
         } else {
           // Predicated vectorized cp.async - extract offsets from vectorized
@@ -330,26 +336,27 @@ public:
 
 private:
   bool in_async{false};
-  bool is_rocm_{false};
+  // bool is_rocm_{false};
 };
 
 using namespace tir::transform;
 
 tvm::transform::Pass InjectPTXAsyncCopy() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    auto target = f->GetAttr<Target>(tvm::attr::kTarget);
-    bool is_rocm = false;
-    if (target.defined()) {
-      is_rocm = TargetIsRocm(target.value());
-    } else {
-      // Fallback: check Target::Current()
-      auto current = Target::Current();
-      if (current.defined()) {
-        is_rocm = TargetIsRocm(current);
-      }
-    }
+    // auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+    // bool is_rocm = false;
+    // if (target.defined()) {
+    //   is_rocm = TargetIsRocm(target.value());
+    // } else {
+    //   // Fallback: check Target::Current()
+    //   auto current = Target::Current();
+    //   if (current.defined()) {
+    //     is_rocm = TargetIsRocm(current);
+    //   }
+    // }
     auto *n = f.CopyOnWrite();
-    n->body = PTXAsyncCopyInjector(is_rocm)(n->body);
+    // n->body = PTXAsyncCopyInjector(is_rocm)(n->body);
+    n->body = PTXAsyncCopyInjector()(n->body);
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectPTXAsyncCopy", {});

@@ -233,25 +233,33 @@ def simplify_index_brackets(code: str) -> str:
     n = len(code)
     while i < n:
         if code[i] == "[":
+            # Scan ahead to find matching ']' and detect nested '['
             depth = 1
-            start = i
+            has_nested = False
             j = i + 1
             while j < n and depth > 0:
                 if code[j] == "[":
                     depth += 1
+                    has_nested = True
                 elif code[j] == "]":
                     depth -= 1
                 j += 1
-            inner = code[start + 1 : j - 1].strip()
-            if inner:
-                try:
-                    simplified = _simplify_expr(inner)
-                    result.append(f"[{simplified}]")
-                except Exception:
-                    result.append(code[start:j])
+            if has_nested:
+                # Nested brackets (e.g. x[idx[(int64_t)0]]) — just emit '['
+                # and let the inner '[' be processed on the next iteration.
+                result.append("[")
+                i += 1
             else:
-                result.append(code[start:j])
-            i = j
+                inner = code[i + 1 : j - 1].strip()
+                if inner:
+                    try:
+                        simplified = _simplify_expr(inner)
+                        result.append(f"[{simplified}]")
+                    except Exception:
+                        result.append(code[i:j])
+                else:
+                    result.append(code[i:j])
+                i = j
         else:
             result.append(code[i])
             i += 1

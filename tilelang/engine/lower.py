@@ -30,7 +30,14 @@ def _default_cuda_postproc(code, target):
 
 @tvm_ffi.register_global_func("tilelang_callback_hip_postproc", override=False)
 def _default_hip_postproc(code, target):
-    return code
+    # print("__file__", code)
+    # return code
+
+    import os
+    import uuid
+    # 在 /tmp/zz 目录下 touch 一个随机文件，借此统计函数调用次数
+    os.makedirs("/tmp/zz", exist_ok=True)
+    os.system(f"touch /tmp/zz/{uuid.uuid4()}")
     return simplify_index_brackets(code)
 
 
