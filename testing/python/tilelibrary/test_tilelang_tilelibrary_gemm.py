@@ -486,8 +486,8 @@ def matmul_rr(
 ):
     A_shape = (K, M) if trans_A else (M, K)
     B_shape = (N, K) if trans_B else (K, N)
-    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
-    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
+    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K) # transA=True (128, 32)
+    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N) # transB=False (128, 32)
     A_frag_shape = A_shared_shape
     B_frag_shape = B_shared_shape
 
@@ -500,8 +500,8 @@ def matmul_rr(
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
-            B_shared = T.alloc_shared(B_shared_shape, in_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, in_dtype) # (128 * 32= 4096)
+            B_shared = T.alloc_shared(B_shared_shape, in_dtype) # (128 * 32= 4096)
             A_frag = T.alloc_fragment(A_frag_shape, in_dtype)
             B_frag = T.alloc_fragment(B_frag_shape, in_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -578,10 +578,15 @@ def run_gemm_rr(
         if trans_B:
             B = B.T
         C = torch.matmul(A.to(torch.float), B.to(torch.float))
+        # C = torch.matmul(A.to(torch.float).cpu(), B.to(torch.float).cpu()).cuda()
         C = C.to(torch.__getattribute__(out_dtype))
+        # torch.cuda.synchronize()
         return C
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    # for i in range(10000):
+        # print(i)
+    for i in range(100):
+        profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
