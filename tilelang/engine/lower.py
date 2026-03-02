@@ -20,6 +20,18 @@ from tilelang.engine.phase import (
     LowerAndLegalize,
     OptimizeForTarget,
 )
+from tilelang.engine.simplify_bracket import simplify_index_brackets
+
+
+@tvm_ffi.register_global_func("tilelang_callback_cuda_postproc", override=False)
+def _default_cuda_postproc(code, target):
+    return simplify_index_brackets(code)
+
+
+@tvm_ffi.register_global_func("tilelang_callback_hip_postproc", override=False)
+def _default_hip_postproc(code, target):
+    return code
+    return simplify_index_brackets(code)
 
 
 def is_cpu_device_backend(target: Target):
@@ -192,7 +204,6 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
         device_mod = tvm.ffi.get_global_func("target.build.metal")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
-
     return device_mod
 
 
@@ -217,7 +228,6 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
         device_mod = tvm.ffi.get_global_func("target.build.metal")(device_mod, target)
     else:
         raise ValueError(f"Target {target.kind.name} is not supported")
-
     return device_mod
 
 
