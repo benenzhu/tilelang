@@ -101,7 +101,7 @@ class LibraryGenerator:
                 "-std=c++17",
                 "-fPIC",
                 "-Rpass-analysis=kernel-resource-usage",
-                "--save-temps",
+                "--save-temps" if os.environ.get("TL_TEMP","") else "",
                 "-g",
                 f"--offload-arch={arch}",
                 "--shared",

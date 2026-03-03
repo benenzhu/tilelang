@@ -88,6 +88,7 @@ static bool IsLdsContiguous(const PrimExpr &flat_offset) {
           return false;
         }
       }
+      LOG(INFO) << L(flat_offset) << L(stride_imm->value);
       return true;
     }
   }
@@ -177,6 +178,7 @@ public:
           // On ROCm, use buffer_load...lds when LDS is lane-contiguous.
           bool lds_contiguous = is_rocm_ && !predicated && bytes == 16 &&
                                 IsLdsContiguous(dst_offset);
+          LOG(INFO) << L(lds_contiguous);
           const Op &op = lds_contiguous
                              ? tl::ptx_cp_async_lds()
                              : tvm::tir::builtin::ptx_cp_async();
@@ -226,15 +228,12 @@ public:
 
             ffi::Array<PrimExpr> cp_async_args{dst_access_ptr, src_access_ptr,
                                                PrimExpr(bytes)};
-            return Evaluate(Call(store->buffer->dtype,
-                                 tvm::tir::builtin::ptx_cp_async(),
-                                 cp_async_args));
-            // bool lds_contiguous_vec = is_rocm_ && bytes == 16 &&
-            //                          IsLdsContiguous(dst_offset);
-            // const Op &op = lds_contiguous_vec
-            //                    ? tl::ptx_cp_async_lds()
-            //                    : tvm::tir::builtin::ptx_cp_async();
-            // return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
+            bool lds_contiguous_vec = is_rocm_ && bytes == 16 &&
+                                     IsLdsContiguous(dst_offset);
+            const Op &op = lds_contiguous_vec
+                               ? tl::ptx_cp_async_lds()
+                               : tvm::tir::builtin::ptx_cp_async();
+            return Evaluate(Call(store->buffer->dtype, op, cp_async_args));
           }
         } else {
           // Predicated vectorized cp.async - extract offsets from vectorized
