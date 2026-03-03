@@ -53,12 +53,12 @@ def matmul_nt(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, accum_dtype=
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=512) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
-            T.annotate_layout(
-                {
-                    A_shared: make_swizzle_layout(A_shared),
-                    B_shared: make_swizzle_layout(B_shared),
-                }
-            )
+            # T.annotate_layout(
+            #     {
+            #         A_shared: make_swizzle_layout(A_shared),
+            #         B_shared: make_swizzle_layout(B_shared),
+            #     }
+            # )
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # Enable rasterization for better L2 cache locality
