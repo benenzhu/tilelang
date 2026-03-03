@@ -155,11 +155,12 @@ class Profiler:
             if lhs is not None and rhs is not None:
                 # in case of numsplit template, the ref output may be None
                 # which means the value is invalid, so we skip the comparison
-                if not torch.allclose(lhs if not is_float8_dtype(lhs.dtype) else lhs.to(torch.float32), rhs if not is_float8_dtype(rhs.dtype) else rhs.to(torch.float32), rtol=rtol, atol=atol):
-                    # print(f"lhs: {lhs}, rhs: {rhs}")
-                    # torch.save("/root/backup.pt", {"lhs": lhs, "rhs": rhs, "ins": ins})
-                    import uuid
-                    torch.save({"lhs": lhs, "rhs": rhs, "ins": ins}, f"/root/backup_{uuid.uuid4().hex}.pt")
+                # if not torch.allclose(
+                #     lhs if not is_float8_dtype(lhs.dtype) else lhs.to(torch.float32), rhs if not is_float8_dtype(rhs.dtype) else rhs.to(torch.float32), rtol=rtol, atol=atol):
+                #     # print(f"lhs: {lhs}, rhs: {rhs}")
+                #     # torch.save("/root/backup.pt", {"lhs": lhs, "rhs": rhs, "ins": ins})
+                #     import uuid
+                #     torch.save({"lhs": lhs, "rhs": rhs, "ins": ins}, f"/root/backup_{uuid.uuid4().hex}.pt")
                 torch_assert_close(
                     lhs if not is_float8_dtype(lhs.dtype) else lhs.to(torch.float32),
                     rhs if not is_float8_dtype(rhs.dtype) else rhs.to(torch.float32),
