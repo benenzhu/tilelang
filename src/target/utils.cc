@@ -16,6 +16,7 @@ bool TargetIsCuda(Target target) {
   return target->GetTargetDeviceType() == kDLCUDA;
 }
 bool TargetIsRocm(Target target) {
+  ICHECK(target.defined()) << target;
   return target->GetTargetDeviceType() == kDLROCM;
 }
 bool TargetIsMetal(Target target) {
