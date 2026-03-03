@@ -767,7 +767,24 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     }
     this->stream << ");\n";
   };
-  if (op->op.same_as(builtin::ptx_cp_async()) ||
+  if (op->op.same_as(tl::ptx_make_buffer_resource())) {
+    // Expression: emits make_wave_buffer_resource((const void*)(ptr))
+    ICHECK(op->args.size() == 1)
+        << "ptx_make_buffer_resource expects 1 argument (global_ptr)";
+    std::string ptr = this->PrintExpr(op->args[0]);
+    os << "make_wave_buffer_resource((const void*)(" << ptr << "))";
+  } else if (op->op.same_as(tl::ptx_cp_async_lds_rsrc())) {
+    // args[0] = dst, args[1] = src, args[2] = bytes, args[3] = rsrc_var
+    ICHECK(op->args.size() == 4)
+        << "ptx_cp_async_lds_rsrc expects 4 arguments";
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = this->PrintExpr(op->args[2]);
+    std::string rsrc = this->PrintExpr(op->args[3]);
+    this->PrintIndent();
+    this->stream << "tl::cp_async_gs_lds_with_rsrc<" << size << ">("
+                 << dst << ", " << src << ", " << rsrc << ");\n";
+  } else if (op->op.same_as(builtin::ptx_cp_async()) ||
       op->op.same_as(tl::ptx_cp_async()) ||
       op->op.same_as(tl::ptx_cp_async_lds())) {
     // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
@@ -1108,8 +1125,37 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
   }
 }
 
+void CodeGenTileLangHIP::VisitStmt_(const LetStmtNode *op) {
+  // For ptx_make_buffer_resource, emit "auto" instead of "void*"
+  // since the actual type is int32x4_t (buffer resource descriptor).
+  if (auto *call = op->value.as<CallNode>()) {
+    if (call->op.same_as(tl::ptx_make_buffer_resource())) {
+      std::string value = PrintExpr(op->value);
+      PrintIndent();
+      stream << "auto " << AllocVarID(op->var.get()) << " = " << value
+             << ";\n";
+      PrintStmt(op->body);
+      return;
+    }
+  }
+  // Default behavior
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
-  if (op->attr_key == tir::attr::async_commit_queue_scope) {
+  if (op->attr_key == "buffer_resource_var") {
+    // Emit: auto {rsrc_var} = make_wave_buffer_resource((const void*)({buf_var}))
+    // node = rsrc_var (Var), value = buf_var (Var)
+    auto rsrc_var = Downcast<Var>(op->node);
+    std::string rsrc_vid = AllocVarID(rsrc_var.get());
+    std::string buf_ptr = PrintExpr(op->value);
+    this->PrintIndent();
+    this->stream << "auto " << rsrc_vid
+                 << " = make_wave_buffer_resource((const void*)(" << buf_ptr
+                 << "));\n";
+    this->VisitStmt(op->body);
+    return;
+  } else if (op->attr_key == tir::attr::async_commit_queue_scope) {
     const IntImmNode *queue_id = op->value.as<IntImmNode>();
     ICHECK(queue_id && queue_id->value == 0)
         << "For CUDA, the index of an async queue must be 0.";

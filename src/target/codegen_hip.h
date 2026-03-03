@@ -49,6 +49,7 @@ public:
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
   void VisitStmt_(const AllocateNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
+  void VisitStmt_(const LetStmtNode *op) final;
 
   // Override this as a work around for __grid_constant__ parameter
   void AddFunction(const PrimFunc &f);

@@ -390,6 +390,25 @@ TVM_DLL const Op &ptx_cp_async();
 TVM_DLL const Op &ptx_cp_async_lds();
 
 /*!
+ * \brief Create a buffer resource descriptor for async G2S LDS copy (gfx950+).
+ *
+ * ptx_make_buffer_resource(global_ptr)
+ *
+ * Returns an int32x4_t buffer resource descriptor via make_wave_buffer_resource.
+ */
+TVM_DLL const Op &ptx_make_buffer_resource();
+
+/*!
+ * \brief Truly async G2S copy with pre-computed buffer resource (gfx950+).
+ *
+ * Same as ptx_cp_async_lds but takes a pre-computed buffer resource descriptor
+ * to avoid redundant make_wave_buffer_resource calls in unrolled loops.
+ *
+ * ptx_cp_async_lds_rsrc(dst_access_ptr, src_access_ptr, bytes, rsrc_var)
+ */
+TVM_DLL const Op &ptx_cp_async_lds_rsrc();
+
+/*!
  * \brief Pack two b16 value into a b32 value
  *
  * int32 pack_b16(b16_value, b16_value)

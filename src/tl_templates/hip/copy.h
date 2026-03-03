@@ -71,7 +71,7 @@ __device__ void async_gld_sld_fence(index_t cnt) {
 __device__ void wave_barrier() { asm volatile("s_barrier" : : : "memory"); }
 
 template <int N = 0> TL_DEVICE void cp_async_wait() {
-  async_gld_fence(0);
+  async_gld_fence(N);
   // or
   // async_gld_sld_fence(N);
 }
@@ -150,6 +150,30 @@ TL_DEVICE void cp_async_gs_lds(void *lds_base_ptr, void const *global_base_ptr) 
     // );
   } else {
     // Fallback: non-16B sizes use VGPR path.
+    cp_async_gs<N>(lds_base_ptr, global_base_ptr);
+  }
+}
+
+// Variant with pre-computed buffer resource descriptor.
+// Use this when multiple cp_async_gs_lds calls share the same global buffer
+// to avoid redundant make_wave_buffer_resource (4x readfirstlane) per call.
+template <int N>
+TL_DEVICE void cp_async_gs_lds_with_rsrc(void *lds_base_ptr,
+                                          void const *global_base_ptr,
+                                          int32x4_t rsrc) {
+  if constexpr (N == 16) {
+    uint32_t my_lo =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(global_base_ptr));
+    uint32_t base_lo = __builtin_amdgcn_readfirstlane(my_lo);
+    uint32_t voffset = my_lo - base_lo;
+
+    uint32_t lds_cur = __builtin_amdgcn_readfirstlane(
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds_base_ptr)));
+    asm volatile("s_mov_b32 m0, %0; \n\t"
+                 "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t"
+                 : : "s"(lds_cur), "v"(voffset), "s"(rsrc)
+                 : "memory");
+  } else {
     cp_async_gs<N>(lds_base_ptr, global_base_ptr);
   }
 }

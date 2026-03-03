@@ -425,6 +425,9 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # as ptx async copy won't be recognized as a valid buffer load
     mod = tilelang.transform.InjectPTXAsyncCopy()(mod)
     print_pass(mod, "InjectPTXAsyncCopy")
+    # Hoist buffer resource descriptors for async G2S LDS copies (ROCm gfx950)
+    mod = tilelang.transform.HoistBufferResource()(mod)
+    print_pass(mod, "HoistBufferResource")
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
         print_pass(mod, "AnnotateWarpGroupRegAlloc")
