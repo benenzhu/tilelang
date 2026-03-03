@@ -141,8 +141,6 @@ class Profiler:
         ref_tensors = ins + ref_outs
         lib_tensors = ins + lib_outs
 
-        print(__file__, "lib_tensors", lib_tensors, flush=True)
-        print(__file__, "ref_tensors", ref_tensors, flush=True)
         assert len(lib_tensors) == len(ref_tensors), "len(lib_tensors) not equals to len(ref_tensors) !"
         # torch.set_printoptions(edgeitems=torch.inf)
         for lhs, rhs in zip(lib_tensors, ref_tensors):

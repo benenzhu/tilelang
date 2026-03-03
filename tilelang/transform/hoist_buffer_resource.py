@@ -7,39 +7,31 @@ computed once and reused across all iterations.
 
 This pass:
 1. Collects all ptx_cp_async_lds calls and extracts their source buffer var
-2. Groups them by source buffer variable
-3. For each unique buffer, creates a LetStmt binding a rsrc variable
-   to ptx_make_buffer_resource(buffer_ptr)
-4. Rewrites ptx_cp_async_lds -> ptx_cp_async_lds_rsrc with the rsrc var
+2. For each unique buffer, emits AttrStmts to declare rsrc + base variables
+3. Rewrites ptx_cp_async_lds -> ptx_cp_async_lds_rsrc(dst, src, bytes, rsrc, base)
 """
 
 from tvm import tir
 from tvm.tir import (
+    AttrStmt,
     Call,
     Evaluate,
-    LetStmt,
     Var,
     PrimFunc,
-    PyStmtExprMutator,
-    PyStmtExprVisitor,
+    stmt_functor,
 )
 from tvm.tir.transform import prim_func_pass
 
 from tilelang.utils.target import target_is_gfx950
 
-# Op handles for the intrinsics we care about
+# Op handles
 _op_ptx_cp_async_lds = tir.op.Op.get("tl.ptx_cp_async_lds")
 _op_ptx_cp_async_lds_rsrc = tir.op.Op.get("tl.ptx_cp_async_lds_rsrc")
-_op_ptx_make_buffer_resource = tir.op.Op.get("tl.ptx_make_buffer_resource")
 _op_tvm_access_ptr = tir.op.Op.get("tir.tvm_access_ptr")
 
 
 def _extract_buffer_var(access_ptr_expr):
-    """Extract the buffer data Var from a tvm_access_ptr call.
-
-    tvm_access_ptr(dtype, data, offset, extent, rw_mask)
-    Returns data (args[1]) as a Var, or None.
-    """
+    """Extract the buffer data Var from a tvm_access_ptr call."""
     if not isinstance(access_ptr_expr, Call):
         return None
     if access_ptr_expr.op != _op_tvm_access_ptr:
@@ -52,80 +44,67 @@ def _extract_buffer_var(access_ptr_expr):
     return None
 
 
-@tir.functor.visitor
-class _BufferResourceCollector(PyStmtExprVisitor):
-    """Collect all unique global buffer Vars used in ptx_cp_async_lds calls."""
+def _collect_buffer_vars(body):
+    """Collect unique global buffer Vars from ptx_cp_async_lds calls.
 
-    def __init__(self):
-        super().__init__()
-        # Map: buffer Var -> rsrc Var (preserves insertion order in Python 3.7+)
-        self.buffer_to_rsrc = {}
+    Returns dict: buf_var -> (rsrc_var, base_var)
+    """
+    buffer_vars = {}
 
-    def visit_evaluate_(self, op):
-        if isinstance(op.value, Call) and op.value.op == _op_ptx_cp_async_lds:
-            # args[1] = src_access_ptr
-            buf_var = _extract_buffer_var(op.value.args[1])
-            if buf_var is not None and buf_var not in self.buffer_to_rsrc:
-                rsrc_name = "__rsrc_" + buf_var.name
-                rsrc_var = Var(rsrc_name, dtype="handle")
-                self.buffer_to_rsrc[buf_var] = rsrc_var
-        # Continue visiting children
-        super().visit_evaluate_(op)
+    def _visitor(stmt):
+        if isinstance(stmt, Evaluate) and isinstance(stmt.value, Call):
+            if stmt.value.op == _op_ptx_cp_async_lds:
+                buf_var = _extract_buffer_var(stmt.value.args[1])
+                if buf_var is not None and buf_var not in buffer_vars:
+                    rsrc_var = Var("__rsrc_" + buf_var.name, dtype="handle")
+                    base_var = Var("__base_" + buf_var.name, dtype="uint32")
+                    buffer_vars[buf_var] = (rsrc_var, base_var)
+
+    stmt_functor.post_order_visit(body, _visitor)
+    return buffer_vars
 
 
-@tir.functor.mutator
-class _BufferResourceRewriter(PyStmtExprMutator):
-    """Rewrite ptx_cp_async_lds -> ptx_cp_async_lds_rsrc using pre-collected rsrc vars."""
+def _rewrite_calls(body, buffer_vars):
+    """Rewrite ptx_cp_async_lds -> ptx_cp_async_lds_rsrc with rsrc + base."""
 
-    def __init__(self, buffer_to_rsrc):
-        super().__init__()
-        self._buffer_to_rsrc = buffer_to_rsrc
+    def _postorder(op):
+        if isinstance(op, Evaluate) and isinstance(op.value, Call):
+            if op.value.op == _op_ptx_cp_async_lds:
+                buf_var = _extract_buffer_var(op.value.args[1])
+                if buf_var is not None and buf_var in buffer_vars:
+                    rsrc_var, base_var = buffer_vars[buf_var]
+                    new_call = Call(
+                        op.value.dtype,
+                        _op_ptx_cp_async_lds_rsrc,
+                        [op.value.args[0], op.value.args[1], op.value.args[2],
+                         rsrc_var, base_var],
+                    )
+                    return Evaluate(new_call)
+        return None
 
-    def visit_evaluate_(self, op):
-        if isinstance(op.value, Call) and op.value.op == _op_ptx_cp_async_lds:
-            buf_var = _extract_buffer_var(op.value.args[1])
-            if buf_var is not None and buf_var in self._buffer_to_rsrc:
-                rsrc_var = self._buffer_to_rsrc[buf_var]
-                new_call = Call(
-                    op.value.dtype,
-                    _op_ptx_cp_async_lds_rsrc,
-                    [op.value.args[0], op.value.args[1], op.value.args[2], rsrc_var],
-                )
-                return Evaluate(new_call)
-        return super().visit_evaluate_(op)
+    return stmt_functor.ir_transform(body, None, _postorder, ["tir.Evaluate"])
 
 
 def HoistBufferResource():
-    """Hoist buffer resource descriptors for async G2S LDS copies (ROCm gfx950).
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
+    """Hoist buffer resource descriptors for async G2S LDS copies (ROCm gfx950)."""
 
     def pass_fn(func: PrimFunc, mod, ctx):
-        # Only apply on gfx950 targets
         target = func.attrs.get("target", None)
         if target is None or not target_is_gfx950(target):
             return func
 
-        # Step 1: Collect all ptx_cp_async_lds calls and their source buffers
-        collector = _BufferResourceCollector()
-        collector.visit_stmt(func.body)
-
-        if not collector.buffer_to_rsrc:
+        # Step 1: Collect
+        buffer_vars = _collect_buffer_vars(func.body)
+        if not buffer_vars:
             return func
 
         # Step 2: Rewrite calls
-        rewriter = _BufferResourceRewriter(collector.buffer_to_rsrc)
-        new_body = rewriter.visit_stmt(func.body)
+        new_body = _rewrite_calls(func.body, buffer_vars)
 
-        # Step 3: Wrap body in LetStmts for rsrc variables
-        # Reverse so first buffer is outermost
-        for buf_var, rsrc_var in reversed(list(collector.buffer_to_rsrc.items())):
-            make_rsrc = Call("handle", _op_ptx_make_buffer_resource, [buf_var])
-            new_body = LetStmt(rsrc_var, make_rsrc, new_body)
+        # Step 3: Wrap in AttrStmts (rsrc + base per buffer)
+        for buf_var, (rsrc_var, base_var) in reversed(list(buffer_vars.items())):
+            new_body = AttrStmt(base_var, "buffer_base_var", buf_var, new_body)
+            new_body = AttrStmt(rsrc_var, "buffer_resource_var", buf_var, new_body)
 
         return func.with_body(new_body)
 
