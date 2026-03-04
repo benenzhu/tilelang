@@ -377,6 +377,49 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
+    def ldmatrix_a_subtile(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki,
+                           i_start, i_count, rk=0):
+        """Load a sub-range of A tiles: i in [i_start, i_start+i_count)."""
+        warp_row_tiles = self.warp_row_tiles
+        warp_rows = self.warp_rows
+        chunk = self.chunk
+        micro_size_x = self.micro_size_x
+        micro_size_k = self.micro_size_k
+        local_size_a = self.local_size_a
+        k_pack = self.k_pack
+        scattered = self.scattered_warp
+        scattered_m_offset = self._scattered_m_offset
+        is_transposed = self.a_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+
+        A_region = self._legalize_to_buffer_region(A_shared_buf)
+        A_buf = A_region.buffer
+        A_base0 = A_region.region[-2].min
+        A_base1 = A_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_a_sub(A_local_buf, A_shared_buf, ki, thread_binding, rk=0):
+            tx, _, warp_m = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for ii in T.serial(i_count):
+                    i = ii + i_start
+                    for local_id in T.vectorized(k_pack * local_size_a):
+                        row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + r + row, A_base1 + l + col]
+            else:
+                for ii in T.serial(i_count):
+                    i = ii + i_start
+                    for local_id in T.vectorized(k_pack * local_size_a):
+                        row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+
+        return _warp_ldmatrix_a_sub(A_local_buf, A_shared_buf, ki, thread_binding, rk)
+
     def ldmatrix_b(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki, rk=0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
@@ -424,6 +467,49 @@ class MatrixCoreIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
+    def ldmatrix_b_subtile(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki,
+                           j_start, j_count, rk=0):
+        """Load a sub-range of B tiles: j in [j_start, j_start+j_count)."""
+        warp_col_tiles = self.warp_col_tiles
+        warp_cols = self.warp_cols
+        chunk = self.chunk
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        local_size_b = self.local_size_b
+        k_pack = self.k_pack
+        scattered = self.scattered_warp
+        scattered_n_offset = self._scattered_n_offset
+        is_transposed = self.b_transposed
+        thread_binding = self.get_thread_binding()
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
+
+        B_region = self._legalize_to_buffer_region(B_shared_buf)
+        B_buf = B_region.buffer
+        B_base0 = B_region.region[-2].min
+        B_base1 = B_region.region[-1].min
+
+        @T.macro
+        def _warp_ldmatrix_b_sub(B_local_buf, B_shared_buf, ki, thread_binding, rk=0):
+            tx, warp_n, _ = self.extract_thread_binding(thread_binding)
+            if is_transposed:
+                for jj in T.serial(j_count):
+                    j = jj + j_start
+                    for local_id in T.vectorized(k_pack * local_size_b):
+                        row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        l = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+            else:
+                for jj in T.serial(j_count):
+                    j = jj + j_start
+                    for local_id in T.vectorized(k_pack * local_size_b):
+                        row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        l = rk * chunk + ki * (k_pack * micro_size_k)
+                        r = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
+                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+
+        return _warp_ldmatrix_b_sub(B_local_buf, B_shared_buf, ki, thread_binding, rk)
+
     def mfma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
@@ -462,6 +548,45 @@ class MatrixCoreIntrinEmitter:
                 )
 
         return _warp_mfma(A_local_buf, B_local_buf, C_local_buf)
+
+    def mfma_subtile(self, A_local_buf, B_local_buf, C_local_buf,
+                     i_start, i_count, j_start, j_count, k_inner=0):
+        """MFMA for a sub-tile: i in [i_start, i_start+i_count), j in [j_start, j_start+j_count)."""
+        warp_cols = self.warp_cols
+        local_size_a = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out = self.local_size_out
+        k_pack = self.k_pack
+        mfma_suffix = self.mfma_suffix
+        a_dtype, b_dtype, out_dtype = self.a_dtype, self.b_dtype, self.accum_dtype
+        compute_a_dtype = a_dtype if local_size_a == 1 else f"{a_dtype}x{local_size_a}"
+        compute_b_dtype = b_dtype if local_size_b == 1 else f"{b_dtype}x{local_size_b}"
+        compute_out_dtype = out_dtype if local_size_out == 1 else f"{out_dtype}x{local_size_out}"
+        warp_rows = self.warp_rows
+
+        a_is_fragment = is_fragment(A_local_buf)
+        b_is_fragment = is_fragment(B_local_buf)
+        a_local_stride = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+        b_local_stride = k_inner * self.warp_cols * k_pack * local_size_b if b_is_fragment else 0
+
+        @T.macro
+        def _warp_mfma_sub(A_local_buf, B_local_buf, C_local_buf):
+            for kp, ii, jj in T.grid(k_pack, i_count, j_count):
+                i = ii + i_start
+                j = jj + j_start
+                T.tvm_mfma(
+                    mfma_suffix, "row", "row",
+                    compute_a_dtype, compute_b_dtype, compute_out_dtype,
+                    B_local_buf.data,
+                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                    A_local_buf.data,
+                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                    C_local_buf.data,
+                    (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
+                    dtype=compute_out_dtype,
+                )
+
+        return _warp_mfma_sub(A_local_buf, B_local_buf, C_local_buf)
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps

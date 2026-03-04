@@ -111,6 +111,11 @@ class GemmMFMA(GemmBase):
 
         assert is_full_region(C_region), "Fragment output C must be a full region"
 
+        # Determine if we should use pingpong (4-cluster) schedule
+        pingpong = (mfma_emitter.scattered_warp and warp_rows >= 4 and warp_cols >= 4)
+        sub_warp_rows = warp_rows // 2 if pingpong else warp_rows
+        sub_warp_cols = warp_cols // 2 if pingpong else warp_cols
+
         if self.is_gemm_ss():
 
             @T.prim_func
@@ -120,27 +125,43 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype) # 4 * 8 * 1，bf16
-                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype) # 8 * 8 * 1, bf16
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))): # 64 // (32 * 1)
-                    # Load A into fragment
-                    mfma_emitter.ldmatrix_a(
-                        A_local,
-                        A_region,
-                        ki,
-                    )
+                if pingpong:
+                    # 4-cluster pingpong schedule:
+                    # Split warp_rows into [0..sub) and [sub..warp_rows)
+                    # Split warp_cols into [0..sub) and [sub..warp_cols)
+                    # Cluster 0: ldA[0:sub_m], ldB[0:sub_n], mfma(sub_m=0, sub_n=0)
+                    # Cluster 1: ldB[sub_n:], mfma(sub_m=0, sub_n=1)
+                    # Cluster 2: ldA[sub_m:], mfma(sub_m=1, sub_n=0)
+                    # Cluster 3: mfma(sub_m=1, sub_n=1)
+                    for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
+                        # Cluster 0: load A sub_m=0, load B sub_n=0, compute
+                        mfma_emitter.ldmatrix_a_subtile(A_local, A_region, ki, 0, sub_warp_rows)
+                        mfma_emitter.ldmatrix_b_subtile(B_local, B_region, ki, 0, sub_warp_cols)
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  0, sub_warp_rows, 0, sub_warp_cols, ki)
 
-                    # Load B into fragment
-                    mfma_emitter.ldmatrix_b(
-                        B_local,
-                        B_region,
-                        ki,
-                    )
+                        # Cluster 1: load B sub_n=1, compute (reuse A sub_m=0)
+                        mfma_emitter.ldmatrix_b_subtile(B_local, B_region, ki, sub_warp_cols, sub_warp_cols)
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  0, sub_warp_rows, sub_warp_cols, sub_warp_cols, ki)
 
-                    # Perform Matrix Multiplication
-                    mfma_emitter.mfma(A_local, B_local, C_buf, ki)
+                        # Cluster 2: load A sub_m=1, compute (reuse B sub_n=0)
+                        mfma_emitter.ldmatrix_a_subtile(A_local, A_region, ki, sub_warp_rows, sub_warp_rows)
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  sub_warp_rows, sub_warp_rows, 0, sub_warp_cols, ki)
+
+                        # Cluster 3: compute (reuse A sub_m=1 and B sub_n=1)
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  sub_warp_rows, sub_warp_rows, sub_warp_cols, sub_warp_cols, ki)
+                else:
+                    for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
+                        mfma_emitter.ldmatrix_a(A_local, A_region, ki)
+                        mfma_emitter.ldmatrix_b(B_local, B_region, ki)
+                        mfma_emitter.mfma(A_local, B_local, C_buf, ki)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis
