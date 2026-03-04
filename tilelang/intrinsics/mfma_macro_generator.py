@@ -378,8 +378,9 @@ class MatrixCoreIntrinEmitter:
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
     def ldmatrix_a_subtile(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki,
-                           i_start, i_count, rk=0):
-        """Load a sub-range of A tiles: i in [i_start, i_start+i_count)."""
+                           i_start, i_count, rk=0, local_offset=0):
+        """Load a sub-range of A tiles: i in [i_start, i_start+i_count).
+        local_offset: extra offset into A_local_buf (in elements) for storing loaded data."""
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         chunk = self.chunk
@@ -408,7 +409,7 @@ class MatrixCoreIntrinEmitter:
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
                         r = rk * chunk + ki * (k_pack * micro_size_k)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + r + row, A_base1 + l + col]
+                        A_local_buf[local_offset + ii * k_pack * local_size_a + local_id] = A_buf[A_base0 + r + row, A_base1 + l + col]
             else:
                 for ii in T.serial(i_count):
                     i = ii + i_start
@@ -416,7 +417,7 @@ class MatrixCoreIntrinEmitter:
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
                         r = rk * chunk + ki * (k_pack * micro_size_k)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+                        A_local_buf[local_offset + ii * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
         return _warp_ldmatrix_a_sub(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
@@ -468,8 +469,9 @@ class MatrixCoreIntrinEmitter:
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
     def ldmatrix_b_subtile(self, B_local_buf, B_shared_buf: Buffer | BufferRegion, ki,
-                           j_start, j_count, rk=0):
-        """Load a sub-range of B tiles: j in [j_start, j_start+j_count)."""
+                           j_start, j_count, rk=0, local_offset=0):
+        """Load a sub-range of B tiles: j in [j_start, j_start+j_count).
+        local_offset: extra offset into B_local_buf (in elements) for storing loaded data."""
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk
@@ -498,7 +500,7 @@ class MatrixCoreIntrinEmitter:
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
                         r = rk * chunk + ki * (k_pack * micro_size_k)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+                        B_local_buf[local_offset + jj * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
             else:
                 for jj in T.serial(j_count):
                     j = jj + j_start
@@ -506,7 +508,7 @@ class MatrixCoreIntrinEmitter:
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l = rk * chunk + ki * (k_pack * micro_size_k)
                         r = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
-                        B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
+                        B_local_buf[local_offset + jj * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 
         return _warp_ldmatrix_b_sub(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
@@ -550,8 +552,10 @@ class MatrixCoreIntrinEmitter:
         return _warp_mfma(A_local_buf, B_local_buf, C_local_buf)
 
     def mfma_subtile(self, A_local_buf, B_local_buf, C_local_buf,
-                     i_start, i_count, j_start, j_count, k_inner=0):
-        """MFMA for a sub-tile: i in [i_start, i_start+i_count), j in [j_start, j_start+j_count)."""
+                     i_start, i_count, j_start, j_count, k_inner=0,
+                     a_local_offset=0, b_local_offset=0):
+        """MFMA for a sub-tile: i in [i_start, i_start+i_count), j in [j_start, j_start+j_count).
+        a_local_offset/b_local_offset: element offsets into A_local/B_local."""
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
         local_size_b = self.local_size_b
@@ -566,8 +570,8 @@ class MatrixCoreIntrinEmitter:
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)
-        a_local_stride = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
-        b_local_stride = k_inner * self.warp_cols * k_pack * local_size_b if b_is_fragment else 0
+        a_local_stride_base = k_inner * warp_rows * k_pack * local_size_a if a_is_fragment else 0
+        b_local_stride_base = k_inner * self.warp_cols * k_pack * local_size_b if b_is_fragment else 0
 
         @T.macro
         def _warp_mfma_sub(A_local_buf, B_local_buf, C_local_buf):
@@ -578,9 +582,9 @@ class MatrixCoreIntrinEmitter:
                     mfma_suffix, "row", "row",
                     compute_a_dtype, compute_b_dtype, compute_out_dtype,
                     B_local_buf.data,
-                    (b_local_stride + (j * k_pack + kp) * local_size_b) // local_size_b,
+                    (b_local_stride_base + b_local_offset + (jj * k_pack + kp) * local_size_b) // local_size_b,
                     A_local_buf.data,
-                    (a_local_stride + (i * k_pack + kp) * local_size_a) // local_size_a,
+                    (a_local_stride_base + a_local_offset + (ii * k_pack + kp) * local_size_a) // local_size_a,
                     C_local_buf.data,
                     (i * warp_cols * local_size_out + j * local_size_out) // local_size_out,
                     dtype=compute_out_dtype,

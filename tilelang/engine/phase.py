@@ -430,6 +430,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # Hoist buffer resource descriptors for async G2S LDS copies (ROCm gfx950)
     mod = tilelang.transform.HoistBufferResource()(mod)
     print_pass(mod, "HoistBufferResource")
+    # Interleave G2S copies with 4-cluster MFMA compute (ROCm gfx950)
+    # TODO: disabled due to downstream pass stack overflow with IfThenElse nodes
+    mod = tilelang.transform.InterleaveG2SMfma()(mod)
+    print_pass(mod, "InterleaveG2SMfma")
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.AnnotateWarpGroupRegAlloc()(mod)
         print_pass(mod, "AnnotateWarpGroupRegAlloc")

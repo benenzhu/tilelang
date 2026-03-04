@@ -9,6 +9,7 @@ from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
 from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
 from .hoist_buffer_resource import HoistBufferResource  # noqa: F401
+from .interleave_g2s import InterleaveG2SMfma  # noqa: F401
 from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
 
 
