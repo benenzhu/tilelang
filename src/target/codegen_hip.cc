@@ -1167,6 +1167,21 @@ void CodeGenTileLangHIP::VisitStmt_(const AttrStmtNode *op) {
                  << "(uint32_t)(uintptr_t)(" << buf_ptr << "));\n";
     this->VisitStmt(op->body);
     return;
+  } else if (op->attr_key == "swizzle_delta_var") {
+    // Emit the swizzle delta as a register-pinned value using inline asm.
+    // A plain `int __swizzle_delta = expr;` gets inlined back by LLVM,
+    // defeating the purpose.  The inline asm acts as an optimisation
+    // barrier, forcing the value to live in a VGPR across the k-loop.
+    auto delta_var = Downcast<Var>(op->node);
+    std::string delta_vid = AllocVarID(delta_var.get());
+    std::string delta_expr = PrintExpr(op->value);
+    this->PrintIndent();
+    this->stream << "int " << delta_vid << ";\n";
+    this->PrintIndent();
+    this->stream << "asm volatile(\"v_mov_b32 %0, %1\" : \"=v\"("
+                 << delta_vid << ") : \"v\"(" << delta_expr << "));\n";
+    this->VisitStmt(op->body);
+    return;
   } else if (op->attr_key == tir::attr::async_commit_queue_scope) {
     const IntImmNode *queue_id = op->value.as<IntImmNode>();
     ICHECK(queue_id && queue_id->value == 0)
