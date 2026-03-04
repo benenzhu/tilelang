@@ -179,6 +179,22 @@ TL_DEVICE void cp_async_gs_lds_with_rsrc(void *lds_base_ptr,
   }
 }
 
+// Variant that takes a direct byte offset (voffset) instead of a global pointer.
+// Avoids the 64-bit pointer arithmetic and the voffset = ptr - base subtraction.
+template <int N>
+TL_DEVICE void cp_async_gs_lds_voffset(void *lds_base_ptr,
+                                        uint32_t voffset,
+                                        int32x4_t rsrc) {
+  if constexpr (N == 16) {
+    uint32_t lds_cur = __builtin_amdgcn_readfirstlane(
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lds_base_ptr)));
+    asm volatile("s_mov_b32 m0, %0; \n\t"
+                 "buffer_load_dwordx4 %1, %2, 0 offen lds;\n\t"
+                 : : "s"(lds_cur), "v"(voffset), "s"(rsrc)
+                 : "memory");
+  }
+}
+
 template <int N>
 TL_DEVICE void cp_async_gs_conditional(void *lds_base_ptr,
                                        void const *global_base_ptr, bool cond) {

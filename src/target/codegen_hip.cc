@@ -774,18 +774,49 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string ptr = this->PrintExpr(op->args[0]);
     os << "make_wave_buffer_resource((const void*)(" << ptr << "))";
   } else if (op->op.same_as(tl::ptx_cp_async_lds_rsrc())) {
-    // args[0] = dst, args[1] = src, args[2] = bytes, args[3] = rsrc_var, args[4] = base_var
+    // args[0] = dst (lds access_ptr), args[1] = src (global access_ptr),
+    // args[2] = bytes, args[3] = rsrc_var, args[4] = base_var
     ICHECK(op->args.size() == 5)
         << "ptx_cp_async_lds_rsrc expects 5 arguments";
     std::string dst = this->PrintExpr(op->args[0]);
-    std::string src = this->PrintExpr(op->args[1]);
     std::string size = this->PrintExpr(op->args[2]);
     std::string rsrc = this->PrintExpr(op->args[3]);
-    std::string base = this->PrintExpr(op->args[4]);
-    this->PrintIndent();
-    this->stream << "tl::cp_async_gs_lds_with_rsrc<" << size << ">("
-                 << dst << ", " << src << ", " << rsrc << ", " << base
-                 << ");\n";
+
+    // Try to extract the element offset from the global source argument
+    // to emit a direct byte-offset call, avoiding 64-bit pointer arithmetic
+    // and the voffset = ptr_lo - base subtraction in the template.
+    //
+    // After lowering, args[1] is: address_of(BufferLoad(buf, [index]))
+    auto src_call = op->args[1].as<CallNode>();
+    const BufferLoadNode *buf_load = nullptr;
+    if (src_call && src_call->op.same_as(builtin::address_of()) &&
+        src_call->args.size() == 1) {
+      buf_load = src_call->args[0].as<BufferLoadNode>();
+    }
+    if (buf_load && buf_load->indices.size() == 1) {
+      // buf_load->buffer->dtype gives element type (e.g. bfloat16)
+      int elem_bytes = buf_load->buffer->dtype.bytes();
+      PrimExpr elem_offset = buf_load->indices[0];
+      PrimExpr byte_offset;
+      if (elem_bytes == 1) {
+        byte_offset = elem_offset;
+      } else {
+        byte_offset = elem_offset * IntImm(elem_offset.dtype(), elem_bytes);
+      }
+      std::string voffset = this->PrintExpr(byte_offset);
+      this->PrintIndent();
+      this->stream << "tl::cp_async_gs_lds_voffset<" << size << ">("
+                   << dst << ", (uint32_t)(" << voffset << "), " << rsrc
+                   << ");\n";
+    } else {
+      // Fallback: use the old pointer-based path
+      std::string src = this->PrintExpr(op->args[1]);
+      std::string base = this->PrintExpr(op->args[4]);
+      this->PrintIndent();
+      this->stream << "tl::cp_async_gs_lds_with_rsrc<" << size << ">("
+                   << dst << ", " << src << ", " << rsrc << ", " << base
+                   << ");\n";
+    }
   } else if (op->op.same_as(builtin::ptx_cp_async()) ||
       op->op.same_as(tl::ptx_cp_async()) ||
       op->op.same_as(tl::ptx_cp_async_lds())) {

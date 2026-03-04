@@ -27,24 +27,24 @@ extern "C" __global__ void __launch_bounds__(512) gemm_kernel(bfloat16_t* __rest
   }
   #pragma unroll
   for (int i_1 = 0; i_1 < 4; ++i_1) {
-    tl::cp_async_gs_lds_with_rsrc<16>((&(A_shared[i_1 * 4096 + threadIdx.x * 8])), (&(A[blockIdx.y * 2097152 + i_1 * 524288 + __g2s_thread_offset])), __rsrc_A, __base_A);
+    tl::cp_async_gs_lds_voffset<16>((&(A_shared[i_1 * 4096 + threadIdx.x * 8])), (uint32_t)(((((blockIdx.y * 2097152) + (i_1 * 524288)) + __g2s_thread_offset) * 2)), __rsrc_A);
   }
   __syncthreads();
   #pragma unroll
   for (int i_2 = 0; i_2 < 4; ++i_2) {
-    tl::cp_async_gs_lds_with_rsrc<16>((&(B_shared[i_2 * 4096 + threadIdx.x * 8])), (&(B[blockIdx.x * 2097152 + i_2 * 524288 + __g2s_thread_offset])), __rsrc_B, __base_B);
+    tl::cp_async_gs_lds_voffset<16>((&(B_shared[i_2 * 4096 + threadIdx.x * 8])), (uint32_t)(((((blockIdx.x * 2097152) + (i_2 * 524288)) + __g2s_thread_offset) * 2)), __rsrc_B);
   }
   tl::cp_async_commit();
   for (int k = 0; k < 127; ++k) {
     __syncthreads();
     #pragma unroll
     for (int i_3 = 0; i_3 < 4; ++i_3) {
-      tl::cp_async_gs_lds_with_rsrc<16>((&(A_shared[(k + 1 & 1) * 16384 + i_3 * 4096 + threadIdx.x * 8])), (&(A[blockIdx.y * 2097152 + i_3 * 524288 + k * 64 + __g2s_thread_offset + 64])), __rsrc_A, __base_A);
+      tl::cp_async_gs_lds_voffset<16>((&(A_shared[(k + 1 & 1) * 16384 + i_3 * 4096 + threadIdx.x * 8])), (uint32_t)(((((((blockIdx.y * 2097152) + (i_3 * 524288)) + (k * 64)) + __g2s_thread_offset) + 64) * 2)), __rsrc_A);
     }
     __syncthreads();
     #pragma unroll
     for (int i_4 = 0; i_4 < 4; ++i_4) {
-      tl::cp_async_gs_lds_with_rsrc<16>((&(B_shared[(k + 1 & 1) * 16384 + i_4 * 4096 + threadIdx.x * 8])), (&(B[blockIdx.x * 2097152 + i_4 * 524288 + k * 64 + __g2s_thread_offset + 64])), __rsrc_B, __base_B);
+      tl::cp_async_gs_lds_voffset<16>((&(B_shared[(k + 1 & 1) * 16384 + i_4 * 4096 + threadIdx.x * 8])), (uint32_t)(((((((blockIdx.x * 2097152) + (i_4 * 524288)) + (k * 64)) + __g2s_thread_offset) + 64) * 2)), __rsrc_B);
     }
     tl::cp_async_commit();
     tl::cp_async_wait<8>();
