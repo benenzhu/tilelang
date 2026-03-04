@@ -81,9 +81,11 @@ class MatrixCoreIntrinEmitter:
         k_pack: int | None = None,
         is_m_first: bool | None = False,
         b_preshuffle: bool | None = False,
+        scattered_warp: bool = False,
         thread_var: Var | None = None,
         target: Target | None = None,
     ):
+        self.scattered_warp = scattered_warp
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
         self.accum_dtype = accum_dtype
@@ -115,6 +117,24 @@ class MatrixCoreIntrinEmitter:
         self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k # 512
         self.num_elems_per_byte = num_elems_per_byte # 1
         self.thread_var = thread_var
+
+    def _scattered_m_offset(self, warp_m, i):
+        """Compute scattered M offset for ldmatrix_a / stmatrix.
+
+        Instead of contiguous: warp_m * warp_row_tiles + i * M_DIM
+        Scatter into sub-tiles: (warp_m + (i // sub_rows) * block_row_warps) * sub_row_tiles + (i % sub_rows) * M_DIM
+
+        With sub_rows = warp_rows // 2, sub_row_tiles = warp_row_tiles // 2.
+        """
+        sub_rows = self.warp_rows // 2
+        sub_row_tiles = self.warp_row_tiles // 2
+        return (warp_m + (i // sub_rows) * self.block_row_warps) * sub_row_tiles + (i % sub_rows) * self.micro_size_x
+
+    def _scattered_n_offset(self, warp_n, j):
+        """Compute scattered N offset for ldmatrix_b / stmatrix."""
+        sub_cols = self.warp_cols // 2
+        sub_col_tiles = self.warp_col_tiles // 2
+        return (warp_n + (j // sub_cols) * self.block_col_warps) * sub_col_tiles + (j % sub_cols) * self.micro_size_y
 
     def _initialize_k_dim(self, a_dtype=T.float16):
         if isinstance(a_dtype, str):
@@ -317,6 +337,8 @@ class MatrixCoreIntrinEmitter:
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
+        scattered = self.scattered_warp
+        scattered_m_offset = self._scattered_m_offset
         local_size_a = self.local_size_a
         k_pack = self.k_pack
         is_transposed = self.a_transposed
@@ -339,22 +361,18 @@ class MatrixCoreIntrinEmitter:
         ):
             tx, _, warp_m = self.extract_thread_binding(thread_binding)
             if is_transposed:
-                for i in T.serial(warp_rows): # 
-                    for local_id in T.vectorized(k_pack * local_size_a): # 1 * 8;
+                for i in T.serial(warp_rows):
+                    for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + i * micro_size_x)
-                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
+                        l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
+                        A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + r + row, A_base1 + l + col]
             else:
-                for i in T.serial(warp_rows): # 每个 warp处理多少行. 64 / 16 = 4
-                    for local_id in T.vectorized(k_pack * local_size_a): # 1 * 8
+                for i in T.serial(warp_rows):
+                    for local_id in T.vectorized(k_pack * local_size_a):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        # row = tx % 16
-                        # col = (tx // 16) * 8 + local_id
-                        # l = warp_m * 64 + i * 16
-                        # r = ki * 32
-                        # A_local[i * 8 + local_id]
-                        # A_s[l + row, r + col]
-                        l, r = (warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
+                        l = T.meta_var(scattered_m_offset(warp_m, i)) if scattered else (warp_m * warp_row_tiles + i * micro_size_x)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
@@ -368,6 +386,8 @@ class MatrixCoreIntrinEmitter:
         local_size_b = self.local_size_b
         k_pack = self.k_pack
         is_transposed = self.b_transposed
+        scattered = self.scattered_warp
+        scattered_n_offset = self._scattered_n_offset
         thread_binding = self.get_thread_binding()
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
 
@@ -390,20 +410,16 @@ class MatrixCoreIntrinEmitter:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (
-                            warp_n * warp_col_tiles + j * micro_size_y,
-                            rk * chunk + ki * (k_pack * micro_size_k),
-                        )
+                        l = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
+                        r = rk * chunk + ki * (k_pack * micro_size_k)
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 
             else:
                 for j in T.serial(warp_cols):
                     for local_id in T.vectorized(k_pack * local_size_b):
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
-                        l, r = (
-                            rk * chunk + ki * (k_pack * micro_size_k),
-                            warp_n * warp_col_tiles + j * micro_size_y,
-                        )
+                        l = rk * chunk + ki * (k_pack * micro_size_k)
+                        r = T.meta_var(scattered_n_offset(warp_n, j)) if scattered else (warp_n * warp_col_tiles + j * micro_size_y)
                         B_local_buf[j * k_pack * local_size_b + local_id] = B_buf[B_base0 + l + row, B_base1 + r + col]
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
@@ -460,6 +476,21 @@ class MatrixCoreIntrinEmitter:
         M_DIM, N_DIM = self.M_DIM, self.N_DIM
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
+        scattered = self.scattered_warp
+        scattered_m_offset = self._scattered_m_offset
+        scattered_n_offset = self._scattered_n_offset
+
+        def _st_row_offset(warp_m, i):
+            """Row pixel offset for stmatrix."""
+            if scattered:
+                return T.meta_var(scattered_m_offset(warp_m, i))
+            return (warp_m * warp_rows + i) * M_DIM
+
+        def _st_col_offset(warp_n, j):
+            """Col pixel offset for stmatrix."""
+            if scattered:
+                return T.meta_var(scattered_n_offset(warp_n, j))
+            return (warp_n * warp_cols + j) * N_DIM
 
         # STS
         # MFMA Store must be in simulated instead of TVM Intrins
@@ -472,11 +503,12 @@ class MatrixCoreIntrinEmitter:
                 for local_id in T.vectorized(local_size_out):
                     row, col = T.meta_var(mfma_store_index_map(tx, local_id))
                     if C_buf_dims == 2:
-                        C_buf[(warp_m * warp_rows + i) * M_DIM + row, (warp_n * warp_cols + j) * N_DIM + col] = C_local_buf[
+                        C_buf[_st_row_offset(warp_m, i) + row, _st_col_offset(warp_n, j) + col] = C_local_buf[
                             i * (warp_cols * local_size_out) + j * local_size_out + local_id
                         ]
                     else:
-                        C_buf[warp_m * warp_rows + i, warp_n * warp_cols + j, row, col] = C_local_buf[
+                        # 4D path: tile indices, not pixel offsets
+                        C_buf[_st_row_offset(warp_m, i) // M_DIM, _st_col_offset(warp_n, j) // N_DIM, row, col] = C_local_buf[
                             i * warp_cols * local_size_out + j * local_size_out + local_id
                         ]
 
@@ -487,7 +519,8 @@ class MatrixCoreIntrinEmitter:
                 for local_id in T.vectorized(local_size_out):
                     row, col = T.meta_var(mfma_store_index_map(tx, local_id))
                     C_buf[
-                        (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row, (pid_n * BLOCK_N + warp_n * warp_cols + j) * N_DIM + col
+                        pid_m * BLOCK_M * M_DIM + _st_row_offset(warp_m, i) + row,
+                        pid_n * BLOCK_N * N_DIM + _st_col_offset(warp_n, j) + col
                     ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out + local_id]
 
         return (
@@ -654,15 +687,27 @@ class MatrixCoreIntrinEmitter:
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         warp_size = self.WARP_SIZE
         is_m_first = self.is_m_first
+        scattered = self.scattered_warp
 
         def forward_thread(i: int, j: int) -> int:
             """
             Given the row index `i` and column index `j` in the fragment,
             map them to a thread index according to `inverse_mfma_store_layout`.
             """
-            # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
-            # the upper bounds of block_row_warps and block_col_warps are warp_rows and warp_cols
-            block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
+            if scattered:
+                # Scattered layout: warp_id = (row_block % block_row_warps) + (col_block % block_col_warps) * block_row_warps
+                # sub_row_tiles = warp_row_tiles // 2, sub_col_tiles = warp_col_tiles // 2
+                sub_rows = warp_rows // 2   # MFMA tiles per sub-tile in M
+                sub_cols = warp_cols // 2    # MFMA tiles per sub-tile in N
+                sub_row_size = sub_rows * micro_size_x  # pixels per sub-tile in M
+                sub_col_size = sub_cols * micro_size_y  # pixels per sub-tile in N
+                # Which sub-tile block this pixel belongs to
+                row_block = i // sub_row_size   # 0..block_row_warps*2-1
+                col_block = j // sub_col_size   # 0..block_col_warps*2-1
+                block_i = row_block % block_row_warps
+                block_j = col_block % block_col_warps
+            else:
+                block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
             # upper bounds of mfma_i and mfma_j are micro_size_x and micro_size_y
             mfma_i, mfma_j = i % micro_size_x, j % micro_size_y
             lane_id, _ = inverse_mfma_store_layout.map_indices([mfma_i, mfma_j])
@@ -678,9 +723,22 @@ class MatrixCoreIntrinEmitter:
             map them to a local index in a single thread according
             to `inverse_mfma_store_layout`.
             """
-            # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
-            # the upper bounds of warp_i and warp_j are warp_rows and warp_cols
-            warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
+            if scattered:
+                sub_rows = warp_rows // 2
+                sub_cols = warp_cols // 2
+                sub_row_size = sub_rows * micro_size_x
+                sub_col_size = sub_cols * micro_size_y
+                # Which sub-tile (0 or 1) in M and N
+                sub_m = (i // sub_row_size) // block_row_warps
+                sub_n = (j // sub_col_size) // block_col_warps
+                # Position within the sub-tile
+                local_tile_i = (i % sub_row_size) // micro_size_x
+                local_tile_j = (j % sub_col_size) // micro_size_y
+                # Map to linear warp_i, warp_j as if contiguous
+                warp_i = sub_m * sub_rows + local_tile_i
+                warp_j = sub_n * sub_cols + local_tile_j
+            else:
+                warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             # upper bounds of mfma_i and mfma_j are micro_size_x and micro_size_y
             mfma_i, mfma_j = i % micro_size_x, j % micro_size_y
             _, local_id = inverse_mfma_store_layout.map_indices([mfma_i, mfma_j])
