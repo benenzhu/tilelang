@@ -208,6 +208,7 @@ def _fix_amd_wait_counts(body, loads_per_group):
 def HoistBufferResource():
     """Hoist buffer resource descriptors & fix async wait counts (ROCm gfx950).
     Currenlty, only loop one time to find a for, maybe bug when script contains multiple for loops. 
+    TODO(zty): may have bug with the latter loops? maybe move this to the 
     """
 
     def pass_fn(func: PrimFunc, mod, ctx):

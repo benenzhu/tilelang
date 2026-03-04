@@ -327,6 +327,8 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         print_pass(mod, "IfStmtBinding")
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
         print_pass(mod, "PlanAndUpdateBufferAllocationLocation")
+        mod = tilelang.transform.Simplify()(mod)
+        print_pass(mod, "Simplify")
         mod = tilelang.transform.PipelinePlanning()(mod)
         print_pass(mod, "PipelinePlanning")
         mod = tilelang.transform.InjectSoftwarePipeline()(mod)
