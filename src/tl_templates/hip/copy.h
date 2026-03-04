@@ -71,7 +71,7 @@ __device__ void async_gld_sld_fence(index_t cnt) {
 __device__ void wave_barrier() { asm volatile("s_barrier" : : : "memory"); }
 
 template <int N = 0> TL_DEVICE void cp_async_wait() {
-  async_gld_fence(N * 8);
+  async_gld_fence(N);
   // or
   // async_gld_sld_fence(N);
 }
