@@ -126,31 +126,30 @@ class GemmMFMA(GemmBase):
                 accumulating into C_local.
                 """
                 num_ki = block_K // (micro_size_k * k_pack) if pingpong else 1
-                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
-                # Pingpong: B_local holds BOTH sub_n=0 and sub_n=1 simultaneously
-                B_local_size = (warp_cols * local_size_b * k_pack * num_ki) if pingpong else (warp_cols * local_size_b * k_pack)
-                B_local = T.alloc_local(B_local_size, in_dtype)
+                # Pingpong: A_local holds BOTH sub_m=0 and sub_m=1 (64 elems)
+                #           B_local holds one sub_n at a time (64 elems)
+                # vs original A=32,B=64: +32 A, same B → same total
+                # vs B=128 scheme: saves 64 B, costs 32 A → net -16 VGPR
+                A_local_size = (warp_rows * local_size_a * k_pack * num_ki) if pingpong else (warp_rows * local_size_a * k_pack)
+                A_local = T.alloc_local(A_local_size, in_dtype)
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
                 if pingpong:
-                    # 4-cluster pingpong with merged ki, no reload:
+                    # 4-cluster pingpong, swapped C1/C2, A double-buffered:
                     #
-                    # A_local[32]: sub_warp_rows(2) × local_size_a(8) × num_ki(2)
-                    #   Holds one sub_m at a time, all ki values
+                    # A_local[64]: [0:32]=sub_m=0 all ki, [32:64]=sub_m=1 all ki
+                    # B_local[64]: one sub_n at a time, overwritten between C1→C2
                     #
-                    # B_local[128]: sub_warp_cols(4) × local_size_b(8) × num_ki(2) × 2_sub_n
-                    #   [0:64]   = sub_n=0, all ki
-                    #   [64:128] = sub_n=1, all ki
-                    #
-                    # Cluster 0: ldA_sub0, ldB_sub0→[0:64],   mfma(0,0)
-                    # Cluster 1:           ldB_sub1→[64:128], mfma(0,1) [reuse A]
-                    # Cluster 2: ldA_sub1,                    mfma(1,0) [reuse B_sub0 from [0:64]]
-                    # Cluster 3:                              mfma(1,1) [reuse A + B_sub1 from [64:128]]
+                    # C0: ldA_sub0→A[0:32],  ldB_sub0, mfma(0,0)
+                    # C1: ldA_sub1→A[32:64],           mfma(1,0)  [B_sub0 reuse]
+                    # C2: ldB_sub1 (overwrites B),     mfma(1,1)  [A_sub1 reuse]
+                    # C3:                              mfma(0,1)  [A_sub0 + B_sub1 reuse]
                     sub_a_elems = sub_warp_rows * local_size_a * k_pack
                     sub_b_elems = sub_warp_cols * local_size_b * k_pack
-                    b_sub1_base = sub_b_elems * num_ki  # = 64, start of sub_n=1 in B_local
+                    a_sub1_base = sub_a_elems * num_ki  # offset to sub_m=1 in A_local
 
-                    # Cluster 0: load A sub_m=0, load B sub_n=0 → B_local[0:64]
+                    # Cluster 0: load A sub_m=0 → A[0:32], load B sub_n=0, mfma(0,0)
                     for ki in T.serial(0, num_ki):
                         mfma_emitter.ldmatrix_a_subtile(A_local, A_region, ki, 0, sub_warp_rows,
                                                         local_offset=ki * sub_a_elems)
@@ -163,32 +162,32 @@ class GemmMFMA(GemmBase):
                                                   a_local_offset=ki * sub_a_elems,
                                                   b_local_offset=ki * sub_b_elems)
 
-                    # Cluster 1: load B sub_n=1 → B_local[64:128], reuse A sub_m=0
+                    # Cluster 1: load A sub_m=1 → A[32:64], reuse B sub_n=0, mfma(1,0)
+                    for ki in T.serial(0, num_ki):
+                        mfma_emitter.ldmatrix_a_subtile(A_local, A_region, ki, sub_warp_rows, sub_warp_rows,
+                                                        local_offset=a_sub1_base + ki * sub_a_elems)
+                    for ki in T.serial(0, num_ki):
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  sub_warp_rows, sub_warp_rows, 0, sub_warp_cols, ki,
+                                                  a_local_offset=a_sub1_base + ki * sub_a_elems,
+                                                  b_local_offset=ki * sub_b_elems)
+
+                    # Cluster 2: load B sub_n=1 (overwrites B), reuse A sub_m=1, mfma(1,1)
                     for ki in T.serial(0, num_ki):
                         mfma_emitter.ldmatrix_b_subtile(B_local, B_region, ki, sub_warp_cols, sub_warp_cols,
-                                                        local_offset=b_sub1_base + ki * sub_b_elems)
+                                                        local_offset=ki * sub_b_elems)
+                    for ki in T.serial(0, num_ki):
+                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
+                                                  sub_warp_rows, sub_warp_rows, sub_warp_cols, sub_warp_cols, ki,
+                                                  a_local_offset=a_sub1_base + ki * sub_a_elems,
+                                                  b_local_offset=ki * sub_b_elems)
+
+                    # Cluster 3: reuse A sub_m=0 from A[0:32] + B sub_n=1, mfma(0,1)
                     for ki in T.serial(0, num_ki):
                         mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
                                                   0, sub_warp_rows, sub_warp_cols, sub_warp_cols, ki,
                                                   a_local_offset=ki * sub_a_elems,
-                                                  b_local_offset=b_sub1_base + ki * sub_b_elems)
-
-                    # Cluster 2: load A sub_m=1, reuse B sub_n=0 from B_local[0:64]
-                    for ki in T.serial(0, num_ki):
-                        mfma_emitter.ldmatrix_a_subtile(A_local, A_region, ki, sub_warp_rows, sub_warp_rows,
-                                                        local_offset=ki * sub_a_elems)
-                    for ki in T.serial(0, num_ki):
-                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
-                                                  sub_warp_rows, sub_warp_rows, 0, sub_warp_cols, ki,
-                                                  a_local_offset=ki * sub_a_elems,
                                                   b_local_offset=ki * sub_b_elems)
-
-                    # Cluster 3: reuse A sub_m=1 + B sub_n=1 from B_local[64:128]
-                    for ki in T.serial(0, num_ki):
-                        mfma_emitter.mfma_subtile(A_local, B_local, C_buf,
-                                                  sub_warp_rows, sub_warp_rows, sub_warp_cols, sub_warp_cols, ki,
-                                                  a_local_offset=ki * sub_a_elems,
-                                                  b_local_offset=b_sub1_base + ki * sub_b_elems)
                 else:
                     for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
                         mfma_emitter.ldmatrix_a(A_local, A_region, ki)
