@@ -1,8 +1,9 @@
 import os
 
-# os.system("rm *.s")
-# os.system('find ~/.tilelang/ -name "*.so" -print -delete')
-# os.system('find ~/.tilelang/ -name "host_kernel.cu" -print -delete')
+os.environ["TL_TEMP"] = "1"
+os.system("rm tmp*")
+os.system('find ~/.tilelang/ -name "*.so" -print -delete')
+os.system('find ~/.tilelang/ -name "host_kernel.cu" -print -delete')
 # os.environ["TL_DISABLE_G2S_HOIST"] = "1"
 import tilelang
 import tilelang.language as T
