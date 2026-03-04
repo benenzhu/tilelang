@@ -1,14 +1,13 @@
-"""Hoist make_wave_buffer_resource out of cp_async_gs_lds calls.
+"""Hoist make_wave_buffer_resource & fix AMD async wait counts.
 
 On gfx950, cp_async_gs_lds<16> calls make_wave_buffer_resource() which
 emits 4x readfirstlane per invocation. When the same global buffer is
 used in an unrolled copy loop, the buffer resource descriptor can be
 computed once and reused across all iterations.
 
-This pass:
-1. Collects all ptx_cp_async_lds calls and extracts their source buffer var
-2. For each unique buffer, emits AttrStmts to declare rsrc + base variables
-3. Rewrites ptx_cp_async_lds -> ptx_cp_async_lds_rsrc(dst, src, bytes, rsrc, base)
+Also fixes async wait counts for AMD: NVIDIA uses commit groups, but
+AMD tracks each buffer_load individually via vmcnt. So wait_group(N)
+must become vmcnt(N * loads_per_group) instead of vmcnt(N).
 """
 
 from tvm import tir
@@ -28,6 +27,7 @@ from tilelang.utils.target import target_is_gfx950
 _op_ptx_cp_async_lds = tir.op.Op.get("tl.ptx_cp_async_lds")
 _op_ptx_cp_async_lds_rsrc = tir.op.Op.get("tl.ptx_cp_async_lds_rsrc")
 _op_tvm_access_ptr = tir.op.Op.get("tir.tvm_access_ptr")
+_op_ptx_cp_async = tir.op.Op.get("tir.ptx_cp_async")
 
 
 def _extract_buffer_var(access_ptr_expr):
@@ -44,11 +44,20 @@ def _extract_buffer_var(access_ptr_expr):
     return None
 
 
-def _collect_buffer_vars(body):
-    """Collect unique global buffer Vars from ptx_cp_async_lds calls.
+def _is_async_load_call(stmt):
+    """Check if a statement is an async load call (any variant)."""
+    if not isinstance(stmt, Evaluate) or not isinstance(stmt.value, Call):
+        return False
+    op = stmt.value.op
+    return op == _op_ptx_cp_async_lds or op == _op_ptx_cp_async_lds_rsrc or op == _op_ptx_cp_async
 
-    Returns dict: buf_var -> (rsrc_var, base_var)
-    """
+
+# ---------------------------------------------------------------------------
+# Buffer resource hoisting
+# ---------------------------------------------------------------------------
+
+def _collect_buffer_vars(body):
+    """Collect unique global buffer Vars from ptx_cp_async_lds calls."""
     buffer_vars = {}
 
     def _visitor(stmt):
@@ -85,27 +94,144 @@ def _rewrite_calls(body, buffer_vars):
     return stmt_functor.ir_transform(body, None, _postorder, ["tir.Evaluate"])
 
 
+# ---------------------------------------------------------------------------
+# AMD async wait count fix
+# ---------------------------------------------------------------------------
+
+def _count_async_loads(stmt, multiplier=1):
+    """Count async load calls in a subtree, multiplying by loop extents."""
+    if _is_async_load_call(stmt):
+        return multiplier
+
+    if isinstance(stmt, tir.For):
+        ext = multiplier
+        if isinstance(stmt.extent, tir.IntImm):
+            ext = multiplier * stmt.extent.value
+        return _count_async_loads(stmt.body, ext)
+
+    if isinstance(stmt, tir.SeqStmt):
+        return sum(_count_async_loads(s, multiplier) for s in stmt.seq)
+
+    if isinstance(stmt, tir.AttrStmt):
+        return _count_async_loads(stmt.body, multiplier)
+
+    if isinstance(stmt, tir.IfThenElse):
+        # Take the max of both branches
+        count = _count_async_loads(stmt.then_case, multiplier)
+        if stmt.else_case is not None:
+            count = max(count, _count_async_loads(stmt.else_case, multiplier))
+        return count
+
+    if isinstance(stmt, tir.LetStmt):
+        return _count_async_loads(stmt.body, multiplier)
+
+    return 0
+
+
+def _contains_commit_scope(stmt):
+    """Check if a subtree contains an async_commit_queue_scope."""
+    found = [False]
+
+    def _v(s):
+        if isinstance(s, tir.AttrStmt) and s.attr_key == "async_commit_queue_scope":
+            found[0] = True
+
+    stmt_functor.post_order_visit(stmt, _v)
+    return found[0]
+
+
+def _find_for_with_commit(stmt):
+    """Find the innermost For loop whose body contains a commit scope."""
+    if isinstance(stmt, tir.For):
+        # Check if a deeper For also has a commit
+        inner = _find_for_with_commit(stmt.body)
+        if inner is not None:
+            return inner
+        if _contains_commit_scope(stmt.body):
+            return stmt
+    elif isinstance(stmt, tir.SeqStmt):
+        for s in stmt.seq:
+            result = _find_for_with_commit(s)
+            if result is not None:
+                return result
+    elif hasattr(stmt, 'body'):
+        # Handles AttrStmt, LetStmt, DeclBuffer, Allocate, etc.
+        return _find_for_with_commit(stmt.body)
+    return None
+
+
+def _get_loads_per_group(body):
+    """Count async loads per commit group.
+
+    NVIDIA commit groups everything since the last commit. The commit
+    scope in TIR only wraps the LAST batch of loads, but earlier loads
+    (e.g. A copies) are outside the scope yet still in the same group.
+
+    So we find the For loop containing the commit and count ALL async
+    loads in one iteration of that loop.
+    """
+    for_node = _find_for_with_commit(body)
+    if for_node is not None:
+        return _count_async_loads(for_node.body)
+    return 0
+
+
+def _fix_amd_wait_counts(body, loads_per_group):
+    """Replace async_wait_inflight_count N with N * loads_per_group.
+
+    AMD has no commit groups — each buffer_load is tracked individually
+    by vmcnt. So "keep N groups in flight" = vmcnt(N * loads_per_group).
+    N=0 (wait all) stays vmcnt(0), which is correct.
+    """
+
+    def _postorder(op):
+        if isinstance(op, tir.AttrStmt):
+            if op.attr_key == "async_wait_inflight_count":
+                if isinstance(op.value, tir.IntImm):
+                    old_n = op.value.value
+                    if old_n > 0:
+                        new_n = old_n * loads_per_group
+                        return tir.AttrStmt(
+                            op.node, op.attr_key,
+                            tir.IntImm("int32", new_n), op.body)
+        return None
+
+    return stmt_functor.ir_transform(body, None, _postorder, ["tir.AttrStmt"])
+
+
+# ---------------------------------------------------------------------------
+# Main pass
+# ---------------------------------------------------------------------------
+
 def HoistBufferResource():
-    """Hoist buffer resource descriptors for async G2S LDS copies (ROCm gfx950)."""
+    """Hoist buffer resource descriptors & fix async wait counts (ROCm gfx950)."""
 
     def pass_fn(func: PrimFunc, mod, ctx):
         target = func.attrs.get("target", None)
         if target is None or not target_is_gfx950(target):
             return func
 
-        # Step 1: Collect
+        # --- Fix AMD async wait counts (before wrapping in AttrStmts) ---
+        loads_per_group = _get_loads_per_group(func.body)
+
+        # --- Buffer resource hoisting ---
         buffer_vars = _collect_buffer_vars(func.body)
-        if not buffer_vars:
-            return func
 
-        # Step 2: Rewrite calls
-        new_body = _rewrite_calls(func.body, buffer_vars)
+        if buffer_vars:
+            new_body = _rewrite_calls(func.body, buffer_vars)
 
-        # Step 3: Wrap in AttrStmts (rsrc + base per buffer)
-        for buf_var, (rsrc_var, base_var) in reversed(list(buffer_vars.items())):
-            new_body = AttrStmt(base_var, "buffer_base_var", buf_var, new_body)
-            new_body = AttrStmt(rsrc_var, "buffer_resource_var", buf_var, new_body)
+            for buf_var, (rsrc_var, base_var) in reversed(list(buffer_vars.items())):
+                new_body = AttrStmt(base_var, "buffer_base_var", buf_var, new_body)
+                new_body = AttrStmt(rsrc_var, "buffer_resource_var", buf_var, new_body)
+        else:
+            new_body = func.body
 
-        return func.with_body(new_body)
+        # --- Apply wait count fix ---
+        if loads_per_group > 1:
+            new_body = _fix_amd_wait_counts(new_body, loads_per_group)
+
+        if new_body is not func.body:
+            return func.with_body(new_body)
+        return func
 
     return prim_func_pass(pass_fn, opt_level=0)
