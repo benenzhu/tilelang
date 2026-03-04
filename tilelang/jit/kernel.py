@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any, Callable, Generic, Literal, TypeVar
 
+from tvm.ir.instrument import DumpIR
+
 # Python 3.9 compatibility for ParamSpec
 try:
     from typing import ParamSpec
@@ -237,7 +239,9 @@ class JITKernel(Generic[_P, _T]):
         # Compile the function with TVM, optimizing with shared memory lowering.
         enable_host_codegen = execution_backend == "tvm_ffi"
         enable_device_compile = execution_backend == "tvm_ffi"
-        with tvm.transform.PassContext(opt_level=3, config=pass_configs), self.target:
+        with tvm.transform.PassContext(opt_level=3, config=pass_configs
+                                    #    , instruments=[DumpIR("./dump", refresh=True)]
+                                    ), self.target:
             artifact = tilelang.lower(
                 tilelang_func,
                 target=target,

@@ -16,8 +16,8 @@ from tilelang.transform.simplify import _Simplify
 class GemmMFMA(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MFMA)
-        warp_row_tiles = int(self.M // m_warp)
-        warp_col_tiles = int(self.N // n_warp)
+        warp_row_tiles = int(self.M // m_warp) # 64
+        warp_col_tiles = int(self.N // n_warp) # 128
         mfma_emitter = MatrixCoreIntrinEmitter(
             a_dtype=self.in_dtype,
             b_dtype=self.in_dtype,
@@ -118,11 +118,11 @@ class GemmMFMA(GemmBase):
                 B_shared into local fragments, then issues Matrix Core mfma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype)
-                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype)
+                A_local = T.alloc_local((warp_rows * local_size_a * k_pack), in_dtype) # 4 * 8 * 1，bf16
+                B_local = T.alloc_local((warp_cols * local_size_b * k_pack), in_dtype) # 8 * 8 * 1, bf16
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))):
+                for ki in T.serial(0, (block_K // (micro_size_k * k_pack))): # 64 // (32 * 1)
                     # Load A into fragment
                     mfma_emitter.ldmatrix_a(
                         A_local,

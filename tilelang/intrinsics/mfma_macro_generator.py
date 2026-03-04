@@ -94,13 +94,13 @@ class MatrixCoreIntrinEmitter:
             target = determine_target("auto", return_object=True)
         self.target = target
         # Hint Information
-        self.block_row_warps = block_row_warps
-        self.block_col_warps = block_col_warps
-        self.warp_row_tiles = warp_row_tiles
-        self.warp_col_tiles = warp_col_tiles
-        self.chunk = chunk
-        self._initialize_k_pack(k_pack)
-        self._initialize_k_dim(a_dtype)
+        self.block_row_warps = block_row_warps # 4 在行列的时候分成了多少个warp?
+        self.block_col_warps = block_col_warps # 2
+        self.warp_row_tiles = warp_row_tiles # 64
+        self.warp_col_tiles = warp_col_tiles # 128
+        self.chunk = chunk # 64
+        self._initialize_k_pack(k_pack) # 2
+        self._initialize_k_dim(a_dtype) 
         self._normalize_gfx950_f16_bf16_kpack()
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_local_size(self.M_DIM, self.N_DIM, self.k_dim, self.WARP_SIZE)
@@ -109,11 +109,11 @@ class MatrixCoreIntrinEmitter:
         self._initialize_is_m_first(is_m_first)
         self._initialize_b_preshuffle(b_preshuffle)
 
-        self.warp_rows = warp_row_tiles // self.micro_size_x
-        self.warp_cols = warp_col_tiles // self.micro_size_y
+        self.warp_rows = warp_row_tiles // self.micro_size_x # 4 每个warp处理多少行
+        self.warp_cols = warp_col_tiles // self.micro_size_y # 8 # 每个warp处理多少列
         self.reduce_k = reduce_k
-        self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k
-        self.num_elems_per_byte = num_elems_per_byte
+        self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k # 512
+        self.num_elems_per_byte = num_elems_per_byte # 1
         self.thread_var = thread_var
 
     def _initialize_k_dim(self, a_dtype=T.float16):
@@ -136,9 +136,9 @@ class MatrixCoreIntrinEmitter:
             raise ValueError(f"Unsupported a_dtype = {a_dtype}")
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16, warp_size=32):
-        self.local_size_a = (m_dim * k_dim) // warp_size
-        self.local_size_b = (n_dim * k_dim) // warp_size
-        self.local_size_out = (m_dim * n_dim) // warp_size
+        self.local_size_a = (m_dim * k_dim) // warp_size # 16 * 32 // 64 = 8
+        self.local_size_b = (n_dim * k_dim) // warp_size # 16 * 32 // 64 = 8 # 哦哦，想一下这个是根据 mfma 的 DIM 来推出来 local_a 和 local_b 的 dim.
+        self.local_size_out = (m_dim * n_dim) // warp_size # 还有output的dim
 
     def _initialize_abbrev(self, a_dtype, b_dtype, accum_dtype):
         self.a_dtype_abbrv = self.dtype_abbrv[a_dtype]
@@ -289,8 +289,8 @@ class MatrixCoreIntrinEmitter:
         Otherwise, it is in the form of [warp_size, block_col_warps (split m), block_row_warps (split n)]
         """
         WARP_SIZE = self.WARP_SIZE
-        block_row_warps = self.block_row_warps
-        block_col_warps = self.block_col_warps
+        block_row_warps = self.block_row_warps # 4
+        block_col_warps = self.block_col_warps # 2
 
         # if is_m_first is None, then use the default value
         if is_m_first is None:
@@ -312,8 +312,8 @@ class MatrixCoreIntrinEmitter:
             return lane_id, warp_n, warp_m
 
     def ldmatrix_a(self, A_local_buf, A_shared_buf: Buffer | BufferRegion, ki, rk=0):
-        warp_row_tiles = self.warp_row_tiles
-        warp_rows = self.warp_rows
+        warp_row_tiles = self.warp_row_tiles # 64
+        warp_rows = self.warp_rows # 4 每个warp处理多少行
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
@@ -321,7 +321,7 @@ class MatrixCoreIntrinEmitter:
         k_pack = self.k_pack
         is_transposed = self.a_transposed
         thread_binding = self.get_thread_binding()
-        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
+        _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False) # line 251
 
         # legalize shared buffer to region
         A_region = self._legalize_to_buffer_region(A_shared_buf)
@@ -339,15 +339,21 @@ class MatrixCoreIntrinEmitter:
         ):
             tx, _, warp_m = self.extract_thread_binding(thread_binding)
             if is_transposed:
-                for i in T.serial(warp_rows):
-                    for local_id in T.vectorized(k_pack * local_size_a):
+                for i in T.serial(warp_rows): # 
+                    for local_id in T.vectorized(k_pack * local_size_a): # 1 * 8;
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
                         l, r = (rk * chunk + ki * (k_pack * micro_size_k), warp_m * warp_row_tiles + i * micro_size_x)
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
             else:
-                for i in T.serial(warp_rows):
-                    for local_id in T.vectorized(k_pack * local_size_a):
+                for i in T.serial(warp_rows): # 每个 warp处理多少行. 64 / 16 = 4
+                    for local_id in T.vectorized(k_pack * local_size_a): # 1 * 8
                         row, col = T.meta_var(reverse_index_map(tx, local_id))
+                        # row = tx % 16
+                        # col = (tx // 16) * 8 + local_id
+                        # l = warp_m * 64 + i * 16
+                        # r = ki * 32
+                        # A_local[i * 8 + local_id]
+                        # A_s[l + row, r + col]
                         l, r = (warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * (k_pack * micro_size_k))
                         A_local_buf[i * k_pack * local_size_a + local_id] = A_buf[A_base0 + l + row, A_base1 + r + col]
 
