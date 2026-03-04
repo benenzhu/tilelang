@@ -10,6 +10,8 @@ AMD tracks each buffer_load individually via vmcnt. So wait_group(N)
 must become vmcnt(N * loads_per_group) instead of vmcnt(N).
 """
 
+import os
+import sys
 from tvm import tir
 from tvm.tir import (
     AttrStmt,
@@ -204,17 +206,17 @@ def _fix_amd_wait_counts(body, loads_per_group):
 # ---------------------------------------------------------------------------
 
 def HoistBufferResource():
-    """Hoist buffer resource descriptors & fix async wait counts (ROCm gfx950)."""
+    """Hoist buffer resource descriptors & fix async wait counts (ROCm gfx950).
+    Currenlty, only loop one time to find a for, maybe bug when script contains multiple for loops. 
+    """
 
     def pass_fn(func: PrimFunc, mod, ctx):
         target = func.attrs.get("target", None)
         if target is None or not target_is_gfx950(target):
             return func
-
-        # --- Fix AMD async wait counts (before wrapping in AttrStmts) ---
-        loads_per_group = _get_loads_per_group(func.body)
-
-        # --- Buffer resource hoisting ---
+        mod = None
+        new_body = func.body
+        # step 1:
         buffer_vars = _collect_buffer_vars(func.body)
 
         if buffer_vars:
@@ -225,8 +227,8 @@ def HoistBufferResource():
                 new_body = AttrStmt(rsrc_var, "buffer_resource_var", buf_var, new_body)
         else:
             new_body = func.body
-
-        # --- Apply wait count fix ---
+        # step 2:
+        loads_per_group = _get_loads_per_group(new_body)
         if loads_per_group > 1:
             new_body = _fix_amd_wait_counts(new_body, loads_per_group)
 
