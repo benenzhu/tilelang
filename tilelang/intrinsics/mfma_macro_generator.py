@@ -350,6 +350,8 @@ class MatrixCoreIntrinEmitter:
         A_buf = A_region.buffer
         A_base0 = A_region.region[-2].min
         A_base1 = A_region.region[-1].min
+        # Leading dimensions (e.g. pipeline stage axis) – empty for 2-D buffers
+        A_other = [r.min for r in A_region.region[:-2]]
 
         @T.macro
         def _warp_ldmatrix_a(
@@ -440,6 +442,8 @@ class MatrixCoreIntrinEmitter:
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
+        # Leading dimensions (e.g. pipeline stage axis) – empty for 2-D buffers
+        B_other = [r.min for r in B_region.region[:-2]]
 
         @T.macro
         def _warp_ldmatrix_b(

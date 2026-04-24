@@ -22,6 +22,9 @@ bool TargetIsRocm(Target target) {
 bool TargetIsMetal(Target target) {
   return target->GetTargetDeviceType() == kDLMetal;
 }
+bool TargetIsCPU(Target target) {
+  return target->GetTargetDeviceType() == kDLCPU;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<tvm::ffi::String>("arch");
@@ -82,6 +85,17 @@ bool TargetIsCDNA(Target target) {
     std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
     // if mcpu start with "gfx9", it is CDNA
     return mcpu.find("gfx9") == 0;
+  }
+  return false;
+}
+
+bool TargetIsRDNA(Target target) {
+  if (!TargetIsRocm(target))
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+    // gfx11xx, gfx12xx are RDNA architectures
+    return mcpu.find("gfx11") == 0 || mcpu.find("gfx12") == 0;
   }
   return false;
 }
@@ -275,6 +289,19 @@ bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty) {
   return false;
 }
 
+int TargetGetRDNAGeneration(Target target) {
+  if (!TargetIsRDNA(target))
+    return 0;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+    if (mcpu.rfind("gfx11", 0) == 0)
+      return 11;
+    if (mcpu.rfind("gfx12", 0) == 0)
+      return 12;
+  }
+  return 0;
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
@@ -296,6 +323,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetIsSM120(target); })
       .def("tl.TargetIsCDNA",
            [](Target target) { return TargetIsCDNA(target); })
+      .def("tl.TargetIsRDNA",
+           [](Target target) { return TargetIsRDNA(target); })
       .def("tl.TargetIsGfx950",
            [](Target target) { return TargetIsGfx950(target); })
       .def("tl.TargetHasAsyncCopy",
@@ -306,6 +335,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetHasStmatrix(target); })
       .def("tl.TargetHasBulkCopy",
            [](Target target) { return TargetHasBulkCopy(target); })
+      .def("tl.TargetGetRDNAGeneration",
+           [](Target target) { return TargetGetRDNAGeneration(target); })
       .def("tl.TargetGetWarpSize",
            [](Target target) { return TargetGetWarpSize(target); });
 }

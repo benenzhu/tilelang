@@ -35,6 +35,12 @@ TVM_DLL bool IsBufferLikeExpr(const PrimExpr &expr);
 // Note: tvm_access_ptr is no longer supported here.
 TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
 
+// Normalize an argument to BufferRegion together with an access mask.
+// If the argument is a tl.region(...) bridge, preserve its encoded mask;
+// otherwise fall back to the provided default mask.
+TVM_DLL AccessRegion NormalizeToAccessRegion(
+    const PrimExpr &arg, int default_access_mask = kAccessReadWrite);
+
 // Build a tvm_access_ptr(handle) from a BufferRegion.
 // - If `require_2d` is true, checks buffer ndim >= 2.
 // - For 1D regions (when allowed), offset=min, extent=extent.
@@ -77,25 +83,31 @@ inline Layout ExpandLayoutToMatchBuffer(const Layout &layout,
 }
 
 inline bool IsSharedBuffer(const Buffer &buffer, bool allow_dynamic = true) {
-  if (allow_dynamic) {
-    return buffer.defined() &&
-           (buffer.scope() == "shared" || buffer.scope() == "shared.dyn");
-  } else {
-    return buffer.defined() && buffer.scope() == "shared";
+  if (!buffer.defined()) {
+    return false;
   }
+  if (allow_dynamic) {
+    return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+  }
+  return buffer.scope() == "shared";
 }
 
 inline bool IsGlobalBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "global";
 }
 
+inline bool IsValidCPAsyncTransferBytes(int bytes) {
+  return bytes == 4 || bytes == 8 || bytes == 16;
+}
+
 inline bool IsLocalBuffer(const Buffer &buffer, bool allow_var = false) {
-  if (allow_var) {
-    return buffer.defined() &&
-           (buffer.scope() == "local" || buffer.scope() == "local.var");
-  } else {
-    return buffer.defined() && buffer.scope() == "local";
+  if (!buffer.defined()) {
+    return false;
   }
+  if (allow_var) {
+    return buffer.scope() == "local" || buffer.scope() == "local.var";
+  }
+  return buffer.scope() == "local";
 }
 
 inline bool IsLocalVarBuffer(const Buffer &buffer) {
