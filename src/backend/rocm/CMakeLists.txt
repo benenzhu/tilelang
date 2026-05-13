@@ -13,13 +13,16 @@ add_compile_definitions(__HIP_PLATFORM_AMD__ __HIP_PLATFORM_HCC__=1)
 # Fallback for build hosts without a ROCm runtime install (e.g. an NV-only
 # machine producing a cross-target wheel). TVM's find_rocm() only succeeds
 # when libamdhip64 is present, but with TILELANG_USE_HIP_STUBS=ON we don't
-# need the runtime library at build time -- only the public HIP/HSA headers
-# (e.g. from `apt install hip-runtime-amd-dev hsa-rocr-dev`, which are
-# header packages and do not require an AMD GPU or driver).
-#
-# Set TILELANG_HIP_INCLUDE_DIR to a directory that contains hip/ and hsa/
-# subtrees, or rely on the default /opt/rocm/include if those headers are
-# installed there. Linking is satisfied by tilelang's hip_stub target.
+# need the runtime library at build time -- only the public HIP/HSA headers.
+# Sources for these, in priority order:
+#   1. TILELANG_HIP_INCLUDE_DIR (cmake var) -- explicit user override
+#   2. $TILELANG_HIP_INCLUDE_DIR (env var)
+#   3. /opt/rocm/include -- system-installed ROCm SDK (e.g. from
+#      `apt install hip-runtime-amd-dev hsa-rocr-dev`, header-only packages
+#      that don't require a GPU/driver)
+#   4. triton's bundled headers at <triton>/backends/amd/include -- triton
+#      ships a complete HIP/HSA header subset regardless of host platform
+# Linking is satisfied by tilelang's hip_stub target in all cases.
 if(NOT ROCM_FOUND AND TILELANG_USE_HIP_STUBS)
   set(_TL_HIP_INC "")
   if(TILELANG_HIP_INCLUDE_DIR)
@@ -28,6 +31,25 @@ if(NOT ROCM_FOUND AND TILELANG_USE_HIP_STUBS)
     set(_TL_HIP_INC "$ENV{TILELANG_HIP_INCLUDE_DIR}")
   elseif(IS_DIRECTORY "/opt/rocm/include")
     set(_TL_HIP_INC "/opt/rocm/include")
+  else()
+    # Last resort: probe for triton's bundled HIP/HSA headers.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_EXECUTABLE)
+      execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c
+          "import os,triton;p=os.path.join(os.path.dirname(triton.__file__),'backends','amd','include');\
+print(p) if os.path.isdir(os.path.join(p,'hip')) and os.path.isdir(os.path.join(p,'hsa')) else None"
+        OUTPUT_VARIABLE _TL_TRITON_HIP_INC
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _TL_TRITON_RC)
+      if(_TL_TRITON_RC EQUAL 0 AND _TL_TRITON_HIP_INC)
+        set(_TL_HIP_INC "${_TL_TRITON_HIP_INC}")
+        message(STATUS "Discovered HIP/HSA headers bundled with triton at ${_TL_HIP_INC}")
+      endif()
+      unset(_TL_TRITON_HIP_INC)
+      unset(_TL_TRITON_RC)
+    endif()
   endif()
 
   if(_TL_HIP_INC AND IS_DIRECTORY "${_TL_HIP_INC}/hip" AND IS_DIRECTORY "${_TL_HIP_INC}/hsa")
@@ -44,7 +66,8 @@ if(NOT ROCM_FOUND AND TILELANG_USE_HIP_STUBS)
   else()
     message(STATUS
       "ROCm runtime library not found on host and HIP/HSA headers were not "
-      "found. Install hip-runtime-amd-dev and hsa-rocr-dev, or set "
+      "found. Install hip-runtime-amd-dev and hsa-rocr-dev, install triton "
+      "(its backends/amd/include is auto-detected), or set "
       "TILELANG_HIP_INCLUDE_DIR to a directory containing hip/ and hsa/.")
   endif()
   unset(_TL_HIP_INC)
