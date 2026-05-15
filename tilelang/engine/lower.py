@@ -175,6 +175,15 @@ def tilelang_callback_hip_compile(code, target):
         verbose=False,
     )
 
+    # Expose the HSACO to whoever started a recorder window (typically a
+    # JITKernel that wants n_regs / n_spills / n_max_threads). No-op if no
+    # recorder is active on this thread.
+    try:
+        from tilelang.jit.adapter.hip_resource_info import record_compiled_hsaco
+        record_compiled_hsaco(code, hsaco)
+    except Exception:  # pragma: no cover -- recording is best-effort
+        pass
+
     return hsaco
 
 

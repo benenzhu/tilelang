@@ -7,6 +7,9 @@
 
 from __future__ import absolute_import as _abs
 
+import hashlib
+import logging
+import os
 import subprocess
 
 import tvm_ffi
@@ -14,6 +17,10 @@ import tvm_ffi
 from tvm.contrib import utils
 from tvm.base import py_str
 from tvm.contrib.rocm import get_rocm_arch, find_rocm_path
+
+from tilelang import env as _tl_env
+
+logger = logging.getLogger(__name__)
 
 
 def compile_hip(code, target_format="hsaco", arch=None, options=None, path_target=None, verbose=False):
@@ -45,11 +52,25 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
         rocm_path = find_rocm_path()
         arch = get_rocm_arch(rocm_path)
 
-    temp = utils.tempdir()
     if target_format not in ["hsaco"]:
         raise ValueError("target_format must be hsaco")
-    temp_code = temp.relpath("my_kernel.cc")
-    temp_target = temp.relpath(f"my_kernel.{target_format}")
+
+    save_temps = _tl_env.should_save_compile_temps()
+    if save_temps:
+        # Persist intermediates next to the HSACO so users can inspect
+        # them. Hash by source so repeated compiles of the same code
+        # share a directory instead of accumulating tmpXXXX dirs.
+        code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+        tmp_dir = os.path.join(_tl_env.TILELANG_CACHE_DIR, "hipcc_tmp", code_hash)
+        os.makedirs(tmp_dir, exist_ok=True)
+    else:
+        # Match the original tvm.contrib.utils.tempdir() lifetime so the
+        # dir is removed when the temp object goes out of scope.
+        temp = utils.tempdir()
+        tmp_dir = temp.path
+
+    temp_code = os.path.join(tmp_dir, "my_kernel.cc")
+    temp_target = os.path.join(tmp_dir, f"my_kernel.{target_format}")
 
     with open(temp_code, "w") as out_file:
         out_file.write(code)
@@ -61,6 +82,13 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
         cmd += [f"--offload-arch={arch}"]
     if target_format == "hsaco":
         cmd += ["--genco"]
+    if save_temps:
+        # See LibraryGenerator.compile_lib for the same flags.
+        cmd += [
+            "--save-temps",
+            "-g",
+            "-Rpass-analysis=kernel-resource-usage",
+        ]
     if options:
         if isinstance(options, str):
             cmd += [options]
@@ -72,11 +100,26 @@ def compile_hip(code, target_format="hsaco", arch=None, options=None, path_targe
     cmd += ["-o", file_target]
     cmd += [temp_code]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # When --save-temps is on, pin TMPDIR + cwd so hipcc/clang's
+    # mkstemp-style intermediates land in tmp_dir instead of /tmp + the
+    # caller's CWD.
+    popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
+    if save_temps:
+        sub_env = dict(os.environ)
+        sub_env["TMPDIR"] = tmp_dir
+        popen_kwargs.update(cwd=tmp_dir, env=sub_env)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
 
     (out, _) = proc.communicate()
     if verbose:
         print(py_str(out))
+
+    if save_temps:
+        try:
+            with open(os.path.join(tmp_dir, "hipcc_compile.log"), "wb") as log_f:
+                log_f.write(out)
+        except OSError:
+            logger.exception("Failed to write hipcc save-temps log")
 
     if proc.returncode != 0:
         msg = code

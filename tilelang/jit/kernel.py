@@ -7,7 +7,7 @@ try:
 except ImportError:  # Python < 3.10
     from typing_extensions import ParamSpec
 
-from tilelang.jit.adapter.utils import is_cutedsl_target, is_metal_target, is_cuda_target
+from tilelang.jit.adapter.utils import is_cutedsl_target, is_metal_target, is_cuda_target, is_hip_target
 from tvm.target import Target
 from tvm.tir import PrimFunc
 
@@ -243,6 +243,17 @@ class JITKernel(Generic[_P, _T]):
             dump_ir_path = pass_configs.get(PassConfigKey.TL_DUMP_IR_DIR, "./dump_ir")  # Default dump path
             pass_instruments.append(tvm.ir.instrument.DumpIR(dump_dir=dump_ir_path))
 
+        # For HIP we record the HSACO bytes that the registered
+        # `tilelang_callback_hip_compile` produces so the JITKernel can
+        # later report n_regs / n_spills / n_max_threads (lazy via
+        # `kernel.resource_usage`).
+        capture_hsaco = is_hip_target(target)
+        if capture_hsaco:
+            from tilelang.jit.adapter.hip_resource_info import (
+                pop_recorded_hsacos,
+                reset_recorder,
+            )
+            reset_recorder()
         with tvm.transform.PassContext(opt_level=3, config=pass_configs, instruments=pass_instruments), self.target:
             artifact = tilelang.lower(
                 tilelang_func,
@@ -251,6 +262,8 @@ class JITKernel(Generic[_P, _T]):
                 enable_host_codegen=enable_host_codegen,
                 enable_device_compile=enable_device_compile,
             )
+        if capture_hsaco:
+            self._hip_hsacos = pop_recorded_hsacos()
 
         self.artifact = artifact
 
@@ -625,6 +638,66 @@ class JITKernel(Generic[_P, _T]):
     @property
     def host_source(self) -> str:
         return str(self.artifact.host_mod) if self.artifact else ""
+
+    @property
+    def resource_usage(self) -> dict[str, Any]:
+        """{kernel_name: KernelResourceUsage} for HIP kernels.
+
+        Reports VGPR / scratch / max-threads-per-block straight from the HIP
+        runtime, mirroring triton's kernel.n_regs / n_spills / n_max_threads.
+        Returns an empty dict on non-HIP targets or when the recording hook
+        didn't capture HSACO bytes (e.g. cached path that skipped lower)."""
+        if getattr(self, "_resource_usage_cache", None) is not None:
+            return self._resource_usage_cache
+        result: dict[str, Any] = {}
+        hsacos = getattr(self, "_hip_hsacos", None) or []
+        if not hsacos or not is_hip_target(self.target):
+            self._resource_usage_cache = result
+            return result
+        from tilelang.jit.adapter.hip_resource_info import (
+            extract_kernel_names,
+            is_available,
+            query_kernel_resources,
+        )
+        if not is_available():
+            self._resource_usage_cache = result
+            return result
+        for code, hsaco in hsacos:
+            for name in extract_kernel_names(code):
+                try:
+                    result[name] = query_kernel_resources(hsaco, name)
+                except Exception as e:  # pragma: no cover - best-effort
+                    logger.debug("resource query failed for %s: %s", name, e)
+        self._resource_usage_cache = result
+        return result
+
+    def _first_resource_usage(self):
+        usage = self.resource_usage
+        if not usage:
+            return None
+        # Prefer the kernel whose name matches the PrimFunc's global_symbol
+        # if it was captured; otherwise fall back to the first one recorded.
+        gsym = None
+        if self.prim_func is not None:
+            gsym = self.prim_func.attrs.get("global_symbol") if self.prim_func.attrs else None
+        if gsym is not None and str(gsym) in usage:
+            return usage[str(gsym)]
+        return next(iter(usage.values()))
+
+    @property
+    def n_regs(self) -> int | None:
+        info = self._first_resource_usage()
+        return info.n_regs if info is not None else None
+
+    @property
+    def n_spills(self) -> int | None:
+        info = self._first_resource_usage()
+        return info.n_spills if info is not None else None
+
+    @property
+    def n_max_threads(self) -> int | None:
+        info = self._first_resource_usage()
+        return info.n_max_threads if info is not None else None
 
     def export_library(self, kernel_file: str) -> None:
         """
