@@ -312,6 +312,10 @@ class Environment:
     TILELANG_CLEANUP_TEMP_FILES = EnvVar(
         "TILELANG_CLEANUP_TEMP_FILES", "0"
     )  # cleanup temporary compiler files/dirs after compilation (default: keep for debugging)
+    TILELANG_SAVE_COMPILE_TEMPS = EnvVar(
+        "TILELANG_SAVE_COMPILE_TEMPS", "0"
+    )  # HIP only: pass --save-temps -g -Rpass-analysis=kernel-resource-usage to hipcc and
+    # persist intermediates (.bc/.s/.o/.out + remarks log) next to the kernel .so
 
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
@@ -363,6 +367,9 @@ class Environment:
 
     def should_cleanup_temp_files(self) -> bool:
         return str(self.TILELANG_CLEANUP_TEMP_FILES).lower() in ("1", "true", "yes", "on")
+
+    def should_save_compile_temps(self) -> bool:
+        return str(self.TILELANG_SAVE_COMPILE_TEMPS).lower() in ("1", "true", "yes", "on")
 
     def get_default_target(self) -> str:
         """Get default compilation target from environment."""

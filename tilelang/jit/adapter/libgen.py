@@ -10,6 +10,7 @@ from typing import Any
 from tvm.target import Target
 
 from tilelang import tvm as tvm
+from tilelang import env as _tl_env
 from tilelang.transform import PassConfigKey
 from tilelang.contrib.nvcc import (
     get_cuda_library_dirs,
@@ -115,7 +116,16 @@ class LibraryGenerator:
         elif is_hip_target(target):
             from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR
 
-            src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
+            save_temps = _tl_env.should_save_compile_temps()
+            # When TILELANG_SAVE_COMPILE_TEMPS is set, drop the .cpp into a
+            # persistent dir so --save-temps' .bc/.s/.o/.out land alongside it
+            # instead of polluting the caller's CWD.
+            tmp_dir_kwargs: dict[str, Any] = {}
+            if save_temps:
+                tmp_dir_kwargs["dir"] = tempfile.mkdtemp(prefix="tilelang_hip_")
+            src = tempfile.NamedTemporaryFile(  # noqa: SIM115
+                mode="w", suffix=".cpp", delete=False, **tmp_dir_kwargs
+            )
             libpath = src.name.replace(".cpp", ".so")
             rocm_path = find_rocm_path()
             arch = target_get_mcpu(target) or get_rocm_arch(rocm_path)
@@ -130,6 +140,10 @@ class LibraryGenerator:
             command += [
                 "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
+            if save_temps:
+                # --save-temps + -g preserve .bc/.s/.o plus debug info
+                # alongside the .so for inspection.
+                command += ["--save-temps", "-g"]
         elif is_cpu_target(target):
             from tilelang.contrib.cc import get_cplus_compiler
 
@@ -173,12 +187,36 @@ class LibraryGenerator:
                 stderr=subprocess.STDOUT,
             )
 
+        # When TILELANG_SAVE_COMPILE_TEMPS is set for HIP, pin TMPDIR + cwd
+        # so hipcc/clang's --save-temps + mkstemp products land in the .so's
+        # dir, and capture combined stdout/stderr to a log file (the
+        # -Rpass-analysis remarks are emitted on stderr).
+        save_temps_log_path: str | None = None
+        if is_hip_target(target) and _tl_env.should_save_compile_temps():
+            src_dir = os.path.dirname(src.name)
+            sub_env = dict(os.environ)
+            sub_env["TMPDIR"] = src_dir
+            run_kwargs.update(
+                cwd=src_dir,
+                env=sub_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            save_temps_log_path = os.path.join(src_dir, "hipcc_compile.log")
+
         try:
             if verbose:
                 print(f"compile_lib compilation command: {' '.join(command)}")
             ret = subprocess.run(command, **run_kwargs)
         except Exception as e:
             raise RuntimeError(f"Compile kernel failed because of {e}") from e
+
+        if save_temps_log_path is not None and ret.stdout:
+            try:
+                with open(save_temps_log_path, "wb") as log_f:
+                    log_f.write(ret.stdout)
+            except OSError:
+                logger.exception("Failed to write hipcc save-temps log")
 
         if ret.returncode != 0:
             captured = ret.stdout.decode("utf-8", errors="replace") if ret.stdout else ""
