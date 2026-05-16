@@ -465,6 +465,16 @@ TVM_DLL const Op &ptx_cp_async_barrier_noinc();
 TVM_DLL const Op &ptx_cp_async();
 
 /*!
+ * \brief Variant of ptx_cp_async (ROCm gfx950) where the destination LDS
+ * write pattern is guaranteed lane-contiguous. The ROCm codegen emits
+ * the direct-to-LDS `buffer_load_dwordx4 ... lds` async path; the
+ * generic ptx_cp_async path continues to use a synchronous uint4 store.
+ *
+ * Same arg list as ptx_cp_async.
+ */
+TVM_DLL const Op &ptx_cp_async_lds_lane_contig();
+
+/*!
  * \brief Pack two b16 value into a b32 value
  *
  * int32 pack_b16(b16_value, b16_value)

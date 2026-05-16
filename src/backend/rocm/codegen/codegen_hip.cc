@@ -947,6 +947,24 @@ void CodeGenTileLangHIP::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
                    << ", " << src << ", " << condition << ");\n";
     }
+  } else if (op->op.same_as(tl::ptx_cp_async_lds_lane_contig())) {
+    // ROCm gfx950 direct-to-LDS async load. The LowerCPAsync
+    // swizzle-swap pass guarantees the dst LDS write pattern is
+    // lane-contiguous for the cp_async calls converted to this op.
+    int total_bytes = GetTileLangCPAsyncTransferBytes(op);
+    std::string dst = this->PrintExpr(op->args[0]);
+    std::string src = this->PrintExpr(op->args[1]);
+    std::string size = std::to_string(total_bytes);
+    this->PrintIndent();
+    if (op->args.size() == 3) {
+      this->stream << "tl::cp_async_gs_lds<" << size << ">(" << dst << ", "
+                   << src << ");\n";
+    } else {
+      // Predicated path -- conservative fallback to plain cp_async_gs.
+      std::string condition = this->PrintExpr(op->args[3]);
+      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
+                   << ", " << src << ", " << condition << ");\n";
+    }
   } else if (op->op.same_as(builtin::ptx_commit_group())) {
     print_extern_call_stmt("tl::cp_async_commit");
   } else if (op->op.same_as(builtin::ptx_wait_group())) {

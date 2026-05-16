@@ -88,6 +88,36 @@ CK_TILE_DEVICE void async_buffer_load_dwordx4_v(void *smem, int32x4_t rsrc,
 }
 #endif // __gfx950__
 
+// gfx950 lane-contig variant: each lane reads N bytes from its own global
+// address and writes them to LDS[m0 + lane*N], bypassing VGPRs. The
+// LowerCPAsync swizzle-swap pass converts ptx_cp_async to
+// ptx_cp_async_lds_lane_contig (codegen-emitted as this template) only
+// when the LDS write pattern is guaranteed lane-contiguous.
+//
+// We pass the full per-thread global pointer to make_wave_buffer_resource
+// (its readfirstlane reduces to lane 0's value, preserving high bits) and
+// derive the per-lane voffset from the low-32-bit pointer delta. This works
+// for both lane-contig and per-lane XOR-permuted global access patterns.
+template <int N>
+TL_DEVICE void cp_async_gs_lds(void *lds_base_ptr,
+                               void const *global_base_ptr) {
+  if constexpr (N == 16) {
+#if defined(__gfx950__)
+    uint32_t my_lo =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(global_base_ptr));
+    uint32_t base_lo = __builtin_amdgcn_readfirstlane(my_lo);
+    uint32_t voffset = my_lo - base_lo;
+    auto rsrc = make_wave_buffer_resource(global_base_ptr);
+    async_buffer_load_dwordx4_v(lds_base_ptr, rsrc, voffset);
+#else
+    *(uint4 *)lds_base_ptr = *(const uint4 *)global_base_ptr;
+#endif
+  } else {
+    // Fall back to the synchronous copy for non-128-bit transfers.
+    *(uint4 *)lds_base_ptr = *(const uint4 *)global_base_ptr;
+  }
+}
+
 template <int N>
 TL_DEVICE void cp_async_gs(void *lds_base_ptr, void const *global_base_ptr) {
   if constexpr (N == 16) {

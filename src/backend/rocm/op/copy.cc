@@ -144,11 +144,9 @@ private:
     if (forwarded.empty())
       return store;
 
-    // LDS write index: drop the XOR from the last forwarded dim. The result
-    // is the lane-contiguous physical position (base + lane * vec_size).
-    // Simplify every dim aggressively so the vec-dependency safety check
-    // below sees the post-simplification form (e.g., (i*8+vec)//8 -> i when
-    // vec is bound to [0, 8)).
+    // LDS write index: drop the XOR from the last forwarded dim. Simplify
+    // every dim so the safety check sees the post-simplification form
+    // (e.g., (i*8+vec)//8 collapses to i when vec is bound to [0, 8)).
     Array<PrimExpr> sequential_store;
     sequential_store.reserve(forwarded.size());
     for (size_t j = 0; j < forwarded.size(); ++j) {
@@ -193,22 +191,23 @@ private:
       }
     }
 
-    // Safety check: the cp_async injector vectorization detector expects
-    // only the LAST output dim of the store and load to vary with the
-    // vectorized for-loop var. If any earlier dim does after simplification,
-    // skip the swap.
+    // Safety check: simplify a COPY of each non-trailing dim and reject
+    // if any still references the vectorized for-loop var. Without
+    // simplify, expressions like (i*8+vec)//8 lexically contain vec even
+    // though they're semantically vec-independent for the bound range.
+    // The pass-through expressions (sequential_store/new_load_indices)
+    // remain un-simplified to avoid disturbing downstream lowering.
     for (int j = 0; j < last_out; ++j) {
-      if (RefsVectorizedVar(sequential_store[j])) {
-        return store;
-      }
+      PrimExpr simp = analyzer_->Simplify(sequential_store[j]);
+      if (RefsVectorizedVar(simp)) return store;
     }
     for (int j = 0; j < last_load; ++j) {
-      if (RefsVectorizedVar(new_load_indices[j])) {
-        return store;
-      }
+      PrimExpr simp = analyzer_->Simplify(new_load_indices[j]);
+      if (RefsVectorizedVar(simp)) return store;
     }
 
     engaged_ = true;
+    engaged_buffers_.insert(new_buffer.get());
     // Use the remapped (swizzle-shaped) buffer with our linear indices --
     // this prevents the later RemapBufferRewriter from re-applying Forward
     // (which would re-introduce the XOR we just removed).
@@ -222,6 +221,39 @@ private:
   arith::Analyzer *analyzer_;
   std::unordered_set<const VarNode *> vectorized_vars_;
   bool engaged_{false};
+
+public:
+  // Buffers (post-remap) whose stores were swapped to lane-contiguous LDS.
+  // Used by the post-Inject pass to switch cp_async calls targeting these
+  // buffers over to the buffer_load_dwordx4...lds variant.
+  std::unordered_set<const BufferNode *> engaged_buffers_;
+};
+
+
+// Post-InjectPTXAsyncCopy pass: for each tl::ptx_cp_async call whose
+// destination access_ptr targets a buffer in `engaged_buffers`, switch
+// the call op to tl::ptx_cp_async_lds_lane_contig so codegen emits the
+// direct-to-LDS path.
+class PromoteToLaneContigCpAsync : public StmtExprMutator {
+public:
+  explicit PromoteToLaneContigCpAsync(
+      const std::unordered_set<const BufferNode *> &engaged)
+      : engaged_(engaged) {}
+
+private:
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    auto call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call->op.same_as(ptx_cp_async())) return call;
+    if (call->args.size() < 3) return call;
+    const auto *dst_call = call->args[0].as<CallNode>();
+    if (dst_call == nullptr || dst_call->args.size() < 2) return call;
+    const BufferLoadNode *load = dst_call->args[0].as<BufferLoadNode>();
+    if (load == nullptr) return call;
+    if (engaged_.count(load->buffer.get()) == 0) return call;
+    return Call(call->dtype, ptx_cp_async_lds_lane_contig(), call->args);
+  }
+
+  const std::unordered_set<const BufferNode *> &engaged_;
 };
 
 enum class CopyInst : uint8_t {
@@ -302,10 +334,6 @@ private:
                                           T.thread_var, analyzer, T.layout_map,
                                           par_op->GetPredicate(T.thread_var));
 
-    // Pre-bind the thread var range so the swap's analyzer can simplify
-    // expressions like (tx % 32 // 16 + ...) cleanly.
-    analyzer->Bind(T.thread_var, T.thread_bounds);
-
     // ROCm-only: rewrite the g2s BufferStore so LDS writes are
     // lane-contiguous (precondition for buffer_load_dwordx4 ... lds).
     //
@@ -317,9 +345,12 @@ private:
     // Enable explicitly with TL_ENABLE_ROCM_SWIZZLE_SWAP=1.
     const char *swap_env = std::getenv("TL_ENABLE_ROCM_SWIZZLE_SWAP");
     bool enable_swap = swap_env && std::string(swap_env) != "0";
+    // The thread var bound here is needed regardless of swap, for the
+    // downstream InjectPTXAsyncCopy vectorization detector.
+    analyzer->Bind(T.thread_var, T.thread_bounds);
+    SwizzleSwapMutator swap_mutator(T.layout_map, T.buffer_remap, analyzer);
     Stmt swapped_loop = lowered_loop;
     if (enable_swap) {
-      SwizzleSwapMutator swap_mutator(T.layout_map, T.buffer_remap, analyzer);
       swapped_loop = swap_mutator(lowered_loop);
     }
 
@@ -328,6 +359,18 @@ private:
                            /*async_without_async_commit_wait=*/
                            no_implicit_commit_wait || GetIsAsyncCopy(op));
     Stmt cp_async_loop = inject_result.stmt;
+
+    // Promote pass intentionally disabled while investigating the
+    // num_elems=1 regression -- when the safety-check simplify path
+    // touches the analyzer, the downstream cp_async injector ends up
+    // producing scalar (2-byte) cp_async calls instead of vectorized
+    // 16-byte ones, breaking the codegen byte-width check. The swap
+    // itself still runs and rewrites BufferStores to lane-contig LDS;
+    // cp_async_gs<16> at the template level chooses uint4 vs buffer_load
+    // (currently uint4 to stay correct on baseline).
+    // TODO: figure out why analyzer Simplify in the safety check leaks
+    // num_elems and re-enable promote + buffer_load template path.
+    (void)swap_mutator;
     if (!inject_result.injected_ptx_async_copy) {
       DLOG(WARNING) << "cp.async rewrite miss for copy src=" << op.src->name
                     << " (scope=" << op.src.scope()
