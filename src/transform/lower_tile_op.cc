@@ -953,9 +953,64 @@ private:
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
     auto buffer = store->buffer;
     if (buffer_remap_.count(buffer)) {
-      auto new_indices = layout_map_[buffer]->Forward(store->indices);
       auto new_buffer = buffer_remap_[store->buffer];
       layout_remap_.Set(new_buffer, layout_map_[store->buffer]);
+
+      // ROCm-only swizzle-swap optimisation: for a g2s copy (BufferStore to
+      // shared whose value is a BufferLoad of a global buffer) where the
+      // destination layout has an XOR swizzle, move the swizzle from the
+      // LDS store side to the global load side. The result is lane-contiguous
+      // LDS addresses, which is what gfx950's buffer_load_dwordx4 ... lds
+      // instruction requires.
+      //
+      // Original:  shared[Forward(local)] = global[base + local]
+      // Rewritten: shared[Forward(local) - delta] = global[base + local + delta]
+      // (XOR is self-inverse, so applying the delta twice returns to original.)
+      if (TargetIsRocm(target_) && !is_ptx_ && IsSharedBuffer(buffer) &&
+          layout_map_[buffer]->HasSwizzle()) {
+        const BufferLoadNode *load_node = nullptr;
+        if (auto *load = store->value.as<BufferLoadNode>()) {
+          if (IsGlobalBuffer(load->buffer)) {
+            load_node = load;
+          }
+        }
+        if (load_node && is_one(layout_map_[buffer]->OutputShape()[0])) {
+          auto swizzled_store = layout_map_[buffer]->Forward(store->indices);
+          PrimExpr delta = analyzer_->Simplify(
+              layout_map_[buffer]->SwizzleDelta(store->indices));
+
+          // Store: drop the XOR from the last output dim.
+          int last_out = static_cast<int>(swizzled_store.size()) - 1;
+          Array<PrimExpr> sequential_store(swizzled_store.begin(),
+                                           swizzled_store.end());
+          sequential_store.Set(
+              last_out,
+              analyzer_->Simplify(swizzled_store[last_out] - delta));
+
+          // Load: apply the delta to the last input dim.
+          int last_in = static_cast<int>(store->indices.size()) - 1;
+          Array<PrimExpr> reflected(store->indices.begin(),
+                                    store->indices.end());
+          reflected.Set(
+              last_in,
+              analyzer_->Simplify(store->indices[last_in] + delta));
+
+          // Global load index = (load_idx - store_idx) + reflected.
+          ICHECK_EQ(load_node->indices.size(), store->indices.size());
+          Array<PrimExpr> new_load_indices;
+          for (size_t k = 0; k < load_node->indices.size(); k++) {
+            PrimExpr base = analyzer_->Simplify(load_node->indices[k] -
+                                                store->indices[k]);
+            new_load_indices.push_back(
+                analyzer_->Simplify(base + reflected[k]));
+          }
+          auto global_load =
+              BufferLoad(load_node->buffer, new_load_indices);
+          return BufferStore(new_buffer, global_load, sequential_store);
+        }
+      }
+
+      auto new_indices = layout_map_[buffer]->Forward(store->indices);
       return BufferStore(new_buffer, store->value, new_indices);
     } else if (var_remap_.count(buffer->data)) {
       auto new_buffer = Buffer(
