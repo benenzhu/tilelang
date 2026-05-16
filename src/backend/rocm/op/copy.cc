@@ -5,6 +5,7 @@
 
 #include "op/copy.h"
 
+#include "layout/layout.h"
 #include "op/builtin.h"
 #include "op/utils.h"
 #include "target/utils.h"
@@ -13,9 +14,12 @@
 #include "transform/ptx_async_copy_injector.h"
 
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace tvm {
@@ -48,6 +52,105 @@ bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Swizzle-swap mutator: rewrite g2s BufferStore to land at lane-contiguous
+// LDS addresses while reflecting the XOR delta to the global side. This is
+// what makes the gfx950 `buffer_load_dwordx4 ... lds` path safe to use.
+//
+// Input (post-LowerParallelLoop, pre-InjectPTXAsyncCopy):
+//
+//     shared_orig[s, m, k] = global_orig[g_row(s,m,k), g_col(s,m,k)]
+//
+// Output (still pre-Inject):
+//
+//     shared_remapped[Forward(s,m,k) with last dim -= delta(s,m,k)]
+//         = global_orig[g_row(s,m,k), g_col(s,m,k) + delta(s,m,k)]
+//
+// Using the remapped buffer directly defeats the later
+// RemapBufferRewriter Forward-apply (it skips already-remapped buffers).
+// ---------------------------------------------------------------------------
+class SwizzleSwapMutator : public StmtExprMutator {
+public:
+  SwizzleSwapMutator(const LayoutMap &layout_map,
+                     const Map<Buffer, Buffer> &buffer_remap,
+                     arith::Analyzer *analyzer)
+      : layout_map_(layout_map),
+        buffer_remap_(buffer_remap),
+        analyzer_(analyzer) {}
+
+  bool engaged() const { return engaged_; }
+
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    // Bind the loop var range so analyzer_->Simplify can fold things like
+    // (vec % 8) -> vec when vec is bound to [0, 8).
+    analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    auto store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    Buffer buffer = store->buffer;
+
+    if (!IsSharedBuffer(buffer))
+      return store;
+    auto layout_it = layout_map_.find(buffer);
+    if (layout_it == layout_map_.end())
+      return store;
+    Layout layout = (*layout_it).second;
+    if (!layout->HasSwizzle())
+      return store;
+    auto remap_it = buffer_remap_.find(buffer);
+    if (remap_it == buffer_remap_.end())
+      return store;
+    Buffer new_buffer = (*remap_it).second;
+
+    const BufferLoadNode *load = store->value.as<BufferLoadNode>();
+    if (load == nullptr)
+      return store;
+    if (!IsGlobalBuffer(load->buffer))
+      return store;
+    if (load->indices.empty())
+      return store;
+
+    // Compute the swizzled (Forward'd) store indices and the per-element
+    // XOR delta. Layout->Forward takes the full store->indices (the
+    // leading dim is just the pipeline stage and passes through unchanged).
+    Array<PrimExpr> forwarded = layout->Forward(store->indices);
+    PrimExpr delta = analyzer_->Simplify(layout->SwizzleDelta(store->indices));
+    if (forwarded.empty())
+      return store;
+
+    // LDS write index: drop the XOR from the last forwarded dim. The result
+    // is the lane-contiguous physical position (base + lane * vec_size).
+    Array<PrimExpr> sequential_store(forwarded.begin(), forwarded.end());
+    int last_out = static_cast<int>(forwarded.size()) - 1;
+    sequential_store.Set(
+        last_out, analyzer_->Simplify(forwarded[last_out] - delta));
+
+    // Global load index: add the XOR delta to the last dim of the global
+    // index (the column dim, where the swizzle lives in the shared layout).
+    Array<PrimExpr> new_load_indices(load->indices.begin(),
+                                     load->indices.end());
+    int last_load = static_cast<int>(load->indices.size()) - 1;
+    new_load_indices.Set(
+        last_load, analyzer_->Simplify(load->indices[last_load] + delta));
+
+    engaged_ = true;
+    // Use the remapped (swizzle-shaped) buffer with our linear indices --
+    // this prevents the later RemapBufferRewriter from re-applying Forward
+    // (which would re-introduce the XOR we just removed).
+    return BufferStore(new_buffer,
+                       BufferLoad(load->buffer, new_load_indices),
+                       sequential_store);
+  }
+
+  const LayoutMap &layout_map_;
+  const Map<Buffer, Buffer> &buffer_remap_;
+  arith::Analyzer *analyzer_;
+  bool engaged_{false};
+};
 
 enum class CopyInst : uint8_t {
   kNormal = 0,
@@ -127,8 +230,29 @@ private:
                                           T.thread_var, analyzer, T.layout_map,
                                           par_op->GetPredicate(T.thread_var));
 
+    // Pre-bind the thread var range so the swap's analyzer can simplify
+    // expressions like (tx % 32 // 16 + ...) cleanly.
+    analyzer->Bind(T.thread_var, T.thread_bounds);
+
+    // ROCm-only: rewrite the g2s BufferStore so LDS writes are
+    // lane-contiguous (precondition for buffer_load_dwordx4 ... lds).
+    //
+    // OFF BY DEFAULT for now: the swap is semantically correct (verified
+    // on 1024^3 NT) but the indices it produces for some layouts (e.g.,
+    // the NN B-matrix tile where the inner row is the wide N dim) defeat
+    // the InjectPTXAsyncCopy vectorization detector and trigger a
+    // "ptx_cp_async requires byte width in {4,8,16}, but got 2" abort.
+    // Enable explicitly with TL_ENABLE_ROCM_SWIZZLE_SWAP=1.
+    const char *swap_env = std::getenv("TL_ENABLE_ROCM_SWIZZLE_SWAP");
+    bool enable_swap = swap_env && std::string(swap_env) != "0";
+    Stmt swapped_loop = lowered_loop;
+    if (enable_swap) {
+      SwizzleSwapMutator swap_mutator(T.layout_map, T.buffer_remap, analyzer);
+      swapped_loop = swap_mutator(lowered_loop);
+    }
+
     auto inject_result =
-        InjectPTXAsyncCopy(lowered_loop, /*enable_auto_async_copy=*/true,
+        InjectPTXAsyncCopy(swapped_loop, /*enable_auto_async_copy=*/true,
                            /*async_without_async_commit_wait=*/
                            no_implicit_commit_wait || GetIsAsyncCopy(op));
     Stmt cp_async_loop = inject_result.stmt;
