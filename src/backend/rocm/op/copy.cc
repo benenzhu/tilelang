@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace tvm {
@@ -84,9 +85,30 @@ public:
 private:
   Stmt VisitStmt_(const ForNode *op) final {
     // Bind the loop var range so analyzer_->Simplify can fold things like
-    // (vec % 8) -> vec when vec is bound to [0, 8).
+    // (vec % 8) -> vec when vec is bound to [0, 8); also remember
+    // vectorized loop vars so we can sanity-check rewritten indices.
     analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
-    return StmtExprMutator::VisitStmt_(op);
+    if (op->kind == ForKind::kVectorized) {
+      vectorized_vars_.insert(op->loop_var.get());
+    }
+    auto stmt = StmtExprMutator::VisitStmt_(op);
+    if (op->kind == ForKind::kVectorized) {
+      vectorized_vars_.erase(op->loop_var.get());
+    }
+    return stmt;
+  }
+
+  // Returns true iff `expr` references any of the active vectorized loop vars.
+  bool RefsVectorizedVar(const PrimExpr &expr) const {
+    bool found = false;
+    PostOrderVisit(expr, [&](const ObjectRef &n) {
+      if (const auto *v = n.as<VarNode>()) {
+        if (vectorized_vars_.count(v)) {
+          found = true;
+        }
+      }
+    });
+    return found;
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
@@ -124,18 +146,67 @@ private:
 
     // LDS write index: drop the XOR from the last forwarded dim. The result
     // is the lane-contiguous physical position (base + lane * vec_size).
-    Array<PrimExpr> sequential_store(forwarded.begin(), forwarded.end());
+    // Simplify every dim aggressively so the vec-dependency safety check
+    // below sees the post-simplification form (e.g., (i*8+vec)//8 -> i when
+    // vec is bound to [0, 8)).
+    Array<PrimExpr> sequential_store;
+    sequential_store.reserve(forwarded.size());
+    for (size_t j = 0; j < forwarded.size(); ++j) {
+      sequential_store.push_back(analyzer_->Simplify(forwarded[j]));
+    }
     int last_out = static_cast<int>(forwarded.size()) - 1;
     sequential_store.Set(
         last_out, analyzer_->Simplify(forwarded[last_out] - delta));
 
     // Global load index: add the XOR delta to the last dim of the global
     // index (the column dim, where the swizzle lives in the shared layout).
-    Array<PrimExpr> new_load_indices(load->indices.begin(),
-                                     load->indices.end());
+    Array<PrimExpr> new_load_indices;
+    new_load_indices.reserve(load->indices.size());
+    for (size_t j = 0; j < load->indices.size(); ++j) {
+      new_load_indices.push_back(analyzer_->Simplify(load->indices[j]));
+    }
     int last_load = static_cast<int>(load->indices.size()) - 1;
     new_load_indices.Set(
         last_load, analyzer_->Simplify(load->indices[last_load] + delta));
+
+    // Safety: skip the swap when the remapped buffer shape has any
+    // non-leading-stage / non-trailing dim greater than 1. That signals
+    // the layout's Forward distributes the column input across multiple
+    // output dims (e.g., wide-N NN gemm B_shared = (32, 128) -> remapped
+    // shape (3, 4, 4, 256)). In that case the per-lane LDS write pattern
+    // is no longer lane-contiguous within a wavefront, so the
+    // buffer_load_dwordx4 ... lds path produces wrong results, and the
+    // cp_async injector falls back to scalar 2-byte transfers anyway.
+    //
+    // The "good" layouts (NT B = (128, 32) -> remapped (3, 1, 16, 256))
+    // have all middle dims == 1 and ARE lane-contiguous after the swap.
+    // The output dim that holds the column-input distribution (`tc` for
+    // the bank-swizzle layouts) sits at shape index 1 for our buffers
+    // (shape = [stage, tc, ts, index]). When tc > 1 the layout splits
+    // the column input across multiple output dims, so the swap output
+    // is no longer lane-contiguous within a wavefront.
+    if (new_buffer->shape.size() >= 2) {
+      if (auto *imm = new_buffer->shape[1].as<IntImmNode>()) {
+        if (imm->value > 1) return store;
+      } else {
+        return store;
+      }
+    }
+
+    // Safety check: the cp_async injector vectorization detector expects
+    // only the LAST output dim of the store and load to vary with the
+    // vectorized for-loop var. If any earlier dim does after simplification,
+    // skip the swap.
+    for (int j = 0; j < last_out; ++j) {
+      if (RefsVectorizedVar(sequential_store[j])) {
+        return store;
+      }
+    }
+    for (int j = 0; j < last_load; ++j) {
+      if (RefsVectorizedVar(new_load_indices[j])) {
+        return store;
+      }
+    }
 
     engaged_ = true;
     // Use the remapped (swizzle-shaped) buffer with our linear indices --
@@ -149,6 +220,7 @@ private:
   const LayoutMap &layout_map_;
   const Map<Buffer, Buffer> &buffer_remap_;
   arith::Analyzer *analyzer_;
+  std::unordered_set<const VarNode *> vectorized_vars_;
   bool engaged_{false};
 };
 
